@@ -1,55 +1,51 @@
+<!-- Ví dụ đơn giản cho templates/index.html -->
 <!DOCTYPE html>
-<html lang="vi">
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Phân Loại Âm Thanh Deepfake</title>
-    <link rel="stylesheet" href="/static/styles.css">
+    <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
 </head>
 <body>
-    <div class="container">
-        <h1>Phân Loại Âm Thanh Thật/Giả</h1>
-        <p>Tải lên file WAV để kiểm tra âm thanh là thật hay giả.</p>
-        
-        <form action="/predict/" method="post" enctype="multipart/form-data">
-            <div class="form-group">
-                <label for="file">Chọn file WAV:</label>
-                <input type="file" id="file" name="file" accept=".wav" required>
-            </div>
-            <div class="form-group">
-                <label for="model_type">Chọn mô hình:</label>
-                <select id="model_type" name="model_type">
-                    <option value="vit">ViT</option>
-                    <option value="cnn">CNN</option>
-                    <option value="both" selected>Cả hai</option>
-                </select>
-            </div>
-            <button type="submit">Phân Loại</button>
-        </form>
+    <h1>Phân Loại Âm Thanh Thật/Giả</h1>
+    {% if error %}
+        <p style="color:red;">Lỗi: {{ error }}</p>
+    {% endif %}
 
-        {% if error %}
-            <div class="error">{{ error }}</div>
-        {% endif %}
+    <form action="/predict/" method="post" enctype="multipart/form-data">
+        <label for="file">Chọn file âm thanh (WAV, MP3, FLAC):</label><br>
+        <input type="file" id="file" name="file" accept=".wav,.mp3,.flac" required><br><br>
 
-        {% if predictions %}
-            <div class="results">
-                <h2>Kết Quả (File: {{ filename }})</h2>
-                <table>
-                    <tr>
-                        <th>Mô Hình</th>
-                        <th>Kết Quả</th>
-                        <th>Xác Suất Giả</th>
-                    </tr>
-                    {% for pred in predictions %}
-                        <tr>
-                            <td>{{ pred.model }}</td>
-                            <td>{{ pred.ket_qua }}</td>
-                            <td>{{ pred.xac_suat_gia | float | round(4) }}</td>
-                        </tr>
-                    {% endfor %}
-                </table>
-            </div>
+        <label>Chọn Model để dự đoán:</label><br>
+        {% if model_options %}
+            {% for option in model_options %}
+                <input type="checkbox" id="{{ option.key }}" name="selected_models" value="{{ option.key }}"
+                       {% if option.key in selected_models_keys %}checked{% endif %}>
+                <label for="{{ option.key }}">{{ option.name }}</label><br>
+            {% endfor %}
+        {% else %}
+            <p>Không có model nào khả dụng để lựa chọn.</p>
         {% endif %}
-    </div>
+        <br>
+        <button type="submit">Dự Đoán</button>
+    </form>
+
+    {% if filename %}
+        <h3>Kết quả cho file: {{ filename }}</h3>
+    {% endif %}
+
+    {% if predictions %}
+        <ul>
+        {% for pred in predictions %}
+            <li>
+                <strong>Model: {{ pred.model_name }} ({{ pred.model_key }})</strong><br>
+                Kết quả: {{ pred.ket_qua }}<br>
+                Xác suất Giả: {{ "%.4f"|format(pred.xac_suat_gia) }}
+                {% if pred.error %}
+                    <br><span style="color:orange;">Thông báo: {{ pred.error }}</span>
+                {% endif %}
+            </li>
+        {% endfor %}
+        </ul>
+    {% endif %}
 </body>
 </html>
