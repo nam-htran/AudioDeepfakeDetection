@@ -1,51 +1,78 @@
-<!-- Ví dụ đơn giản cho templates/index.html -->
+<!-- templates/index.html -->
 <!DOCTYPE html>
-<html>
+<html lang="vi">
 <head>
-    <title>Phân Loại Âm Thanh Deepfake</title>
-    <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Phân Loại Âm Thanh Deepfake (Local)</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+        .container { background-color: white; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        h1, h2 { color: #333; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; }
+        input[type="file"], select, button { padding: 10px; margin-top: 5px; border-radius: 4px; border: 1px solid #ddd; }
+        button { background-color: #007bff; color: white; cursor: pointer; }
+        button:hover { background-color: #0056b3; }
+        .results { margin-top: 20px; }
+        .result-card { border: 1px solid #eee; padding: 15px; margin-bottom: 10px; border-radius: 4px; background-color: #f9f9f9; }
+        .result-card h3 { margin-top: 0; }
+        .error { color: red; font-weight: bold; border: 1px solid red; padding: 10px; margin-bottom:15px; background-color: #ffebee; }
+        .model-selection label { display: inline-block; margin-right: 15px; }
+    </style>
 </head>
 <body>
-    <h1>Phân Loại Âm Thanh Thật/Giả</h1>
-    {% if error %}
-        <p style="color:red;">Lỗi: {{ error }}</p>
-    {% endif %}
+    <div class="container">
+        <h1>Phân Loại Âm Thanh Deepfake (Chạy Local)</h1>
 
-    <form action="/predict/" method="post" enctype="multipart/form-data">
-        <label for="file">Chọn file âm thanh (WAV, MP3, FLAC):</label><br>
-        <input type="file" id="file" name="file" accept=".wav,.mp3,.flac" required><br><br>
-
-        <label>Chọn Model để dự đoán:</label><br>
-        {% if model_options %}
-            {% for option in model_options %}
-                <input type="checkbox" id="{{ option.key }}" name="selected_models" value="{{ option.key }}"
-                       {% if option.key in selected_models_keys %}checked{% endif %}>
-                <label for="{{ option.key }}">{{ option.name }}</label><br>
-            {% endfor %}
-        {% else %}
-            <p>Không có model nào khả dụng để lựa chọn.</p>
+        {% if error %}
+            <div class="error">{{ error }}</div>
         {% endif %}
-        <br>
-        <button type="submit">Dự Đoán</button>
-    </form>
 
-    {% if filename %}
-        <h3>Kết quả cho file: {{ filename }}</h3>
-    {% endif %}
+        <form action="/predict/" method="post" enctype="multipart/form-data">
+            <div class="form-group">
+                <label for="file">Chọn file âm thanh (WAV, MP3, FLAC):</label>
+                <input type="file" name="file" id="file" accept=".wav,.mp3,.flac" required>
+            </div>
 
-    {% if predictions %}
-        <ul>
-        {% for pred in predictions %}
-            <li>
-                <strong>Model: {{ pred.model_name }} ({{ pred.model_key }})</strong><br>
-                Kết quả: {{ pred.ket_qua }}<br>
-                Xác suất Giả: {{ "%.4f"|format(pred.xac_suat_gia) }}
-                {% if pred.error %}
-                    <br><span style="color:orange;">Thông báo: {{ pred.error }}</span>
-                {% endif %}
-            </li>
-        {% endfor %}
-        </ul>
-    {% endif %}
+            {% if model_options %}
+                <div class="form-group model-selection">
+                    <label>Chọn Model để dự đoán:</label><br>
+                    {% for model_opt in model_options %}
+                        <input type="checkbox" name="selected_models" value="{{ model_opt.key }}" id="model_{{ model_opt.key }}"
+                               {% if selected_models_keys and model_opt.key in selected_models_keys %}checked{% endif %}>
+                        <label for="model_{{ model_opt.key }}">{{ model_opt.name }}</label><br>
+                    {% endfor %}
+                </div>
+            {% else %}
+                <p class="error">Không có model nào khả dụng để lựa chọn. Vui lòng kiểm tra console.</p>
+            {% endif %}
+
+            <button type="submit" {% if not model_options %}disabled{% endif %}>Phân Loại</button>
+        </form>
+
+        {% if filename %}
+            <h2>Kết quả cho file: {{ filename }}</h2>
+        {% endif %}
+
+        {% if predictions %}
+            <div class="results">
+                {% for pred in predictions %}
+                    <div class="result-card">
+                        <h3>Model: {{ pred.model_name }} (Key: {{ pred.model_key }})</h3>
+                        {% if pred.error %}
+                            <p class="error">Lỗi: {{ pred.error }}</p>
+                        {% else %}
+                            <p><strong>Kết quả:</strong> <span style="font-weight: bold; color: {% if pred.ket_qua == 'Giả' %}red{% else %}green{% endif %};">{{ pred.ket_qua }}</span></p>
+                            <p><strong>Xác suất là Giả:</strong> {{ "%.2f"|format(pred.xac_suat_gia * 100) }}%</p>
+                            <div style="width: 100%; background-color: #e0e0e0; border-radius: 5px; height: 10px;">
+                                <div style="width: {{ pred.xac_suat_gia * 100 }}%; background-color: {% if pred.xac_suat_gia > 0.5 %}red{% else %}green{% endif %}; height: 10px; border-radius: 5px;"></div>
+                            </div>
+                        {% endif %}
+                    </div>
+                {% endfor %}
+            </div>
+        {% endif %}
+    </div>
 </body>
 </html>

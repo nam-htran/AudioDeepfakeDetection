@@ -4,7 +4,7 @@ import numpy as np
 import librosa
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+import torch.nn.functional as F # Quan trọng cho AudioCNN
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form, Query
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
@@ -12,73 +12,93 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import io
 import soundfile as sf
-# import requests # Không cần requests nữa nếu không tải từ URL
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any # Thêm Any
 
 # --- FastAPI App ---
-app = FastAPI(title="Phân Loại Âm Thanh Deepfake (Local - Models từ Thư mục)", description="API và giao diện phân loại âm thanh thật/giả")
+app = FastAPI(title="Phân Loại Âm Thanh Deepfake (Local - Models từ Thư mục)",
+              description="API và giao diện phân loại âm thanh thật/giả")
 
 # --- Mount static files và templates ---
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+# Đảm bảo bạn có thư mục 'static' và 'templates' cùng cấp với main_deploy.py
+# và file 'index.html' nằm trong 'templates', 'styles.css' (nếu có) trong 'static'
+STATIC_DIR = Path("./static")
+TEMPLATES_DIR = Path("./templates")
+if not STATIC_DIR.exists() or not TEMPLATES_DIR.exists():
+    print(f"CẢNH BÁO: Thư mục 'static' ({STATIC_DIR.resolve()}) hoặc 'templates' ({TEMPLATES_DIR.resolve()}) không tồn tại.")
+    print("Giao diện có thể không hoạt động đúng.")
+    # Tạo thư mục mẫu nếu chưa có để tránh lỗi FastAPI, nhưng bạn cần thêm file thực tế
+    STATIC_DIR.mkdir(parents=True, exist_ok=True)
+    TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+    # Tạo file index.html mẫu nếu chưa có
+    sample_index_html_path = TEMPLATES_DIR / "index.html"
+    if not sample_index_html_path.exists():
+        with open(sample_index_html_path, "w", encoding="utf-8") as f:
+            f.write("<h1>Ứng dụng Phân loại Âm thanh Deepfake</h1><p>Vui lòng hoàn thiện file index.html!</p>")
+        print(f"Đã tạo file mẫu: {sample_index_html_path}")
+
+
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
+
 
 # --- Config chung ---
 SR = 16000
 N_FFT = 2048
 HOP_LENGTH = 512
 N_MELS = 128
-MAX_FRAMES_SPEC = 313
+MAX_FRAMES_SPEC = 313 # Giữ nguyên từ notebook
 FMIN = 0.0
-FMAX = None
+FMAX = None # Sẽ là sr/2
 NORM_EPSILON = 1e-6
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
 # --- Đường dẫn đến thư mục chứa các model đã huấn luyện ---
 MODEL_TRAINED_DIR = Path("./model_trained") # Đảm bảo thư mục này tồn tại và chứa các file .pth
+MODEL_TRAINED_DIR.mkdir(parents=True, exist_ok=True) # Tạo thư mục nếu chưa có
 
 # --- CẤU HÌNH CHO 6 MODELS (Giả định file .pth nằm trong MODEL_TRAINED_DIR) ---
-MODEL_CONFIGS = {
+MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
     "vit_small": {
-        "name": "ViT Small",
+        "name": "ViT Small (Local)",
         "type": "ViT",
         "local_path": MODEL_TRAINED_DIR / "best_vit_small_model.pth",
         "params": {"patch_size": 16, "embed_dim": 192, "depth": 5, "num_heads": 6, "mlp_ratio": 4.0, "drop_rate": 0.1, "attn_drop_rate": 0.1}
     },
     "vit_medium": {
-        "name": "ViT Medium",
+        "name": "ViT Medium (Local)",
         "type": "ViT",
         "local_path": MODEL_TRAINED_DIR / "best_vit_medium_model.pth",
         "params": {"patch_size": 16, "embed_dim": 384, "depth": 6, "num_heads": 6, "mlp_ratio": 4.0, "drop_rate": 0.1, "attn_drop_rate": 0.1}
     },
     "vit_large": {
-        "name": "ViT Large",
+        "name": "ViT Large (Local)",
         "type": "ViT",
         "local_path": MODEL_TRAINED_DIR / "best_vit_large_model.pth",
         "params": {"patch_size": 16, "embed_dim": 512, "depth": 6, "num_heads": 8, "mlp_ratio": 4.0, "drop_rate": 0.1, "attn_drop_rate": 0.1}
     },
     "cnn_small": {
-        "name": "CNN Small",
+        "name": "CNN Small (Local)",
         "type": "CNN",
         "local_path": MODEL_TRAINED_DIR / "best_cnn_small_model.pth",
         "params": {"dropout_rate": 0.4, "channels": [16, 32, 64, 128], "fc_nodes": [128, 32]}
     },
     "cnn_medium": {
-        "name": "CNN Medium",
+        "name": "CNN Medium (Local)",
         "type": "CNN",
         "local_path": MODEL_TRAINED_DIR / "best_cnn_medium_model.pth",
         "params": {"dropout_rate": 0.4, "channels": [32, 64, 128, 256], "fc_nodes": [256, 128]}
     },
     "cnn_large": {
-        "name": "CNN Large",
+        "name": "CNN Large (Local)",
         "type": "CNN",
         "local_path": MODEL_TRAINED_DIR / "best_cnn_large_model.pth",
         "params": {"dropout_rate": 0.4, "channels": [32, 64, 128, 256], "fc_nodes": [512, 128]}
     }
 }
 
-# --- Định Nghĩa Mô Hình ViT (Giữ nguyên) ---
+# --- Định Nghĩa Mô Hình ViT (Giống code bạn cung cấp, khớp với notebook Kaggle) ---
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=(N_MELS, MAX_FRAMES_SPEC), patch_size=16, in_chans=3, embed_dim=768):
         super().__init__()
@@ -90,12 +110,15 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
+        # Thêm kiểm tra kích thước nếu cần, hoặc đảm bảo đầu vào luôn đúng
+        # if H != self.img_size[0] or W != self.img_size[1]:
+        #     print(f"Warning: Input HxW {H}x{W} not matching model HxW {self.img_size[0]}x{self.img_size[1]}")
         x = self.proj(x)
         x = x.flatten(2)
         x = x.transpose(1, 2)
         return x
 
-class Attention(nn.Module):
+class Attention(nn.Module): # Giữ nguyên
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
@@ -105,7 +128,6 @@ class Attention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
-
     def forward(self, x):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
@@ -118,7 +140,7 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
 
-class Mlp(nn.Module):
+class Mlp(nn.Module): # Giữ nguyên
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
@@ -127,16 +149,12 @@ class Mlp(nn.Module):
         self.act = act_layer()
         self.fc2 = nn.Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
-
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
+        x = self.fc1(x); x = self.act(x); x = self.drop(x)
+        x = self.fc2(x); x = self.drop(x)
         return x
 
-class Block(nn.Module):
+class Block(nn.Module): # Giữ nguyên
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -144,16 +162,15 @@ class Block(nn.Module):
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-
     def forward(self, x):
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
 
-class VisionTransformer(nn.Module):
+class VisionTransformer(nn.Module): # Giữ nguyên từ notebook (tham số hóa)
     def __init__(self, img_size=(N_MELS, MAX_FRAMES_SPEC), patch_size=16, in_chans=3, num_classes=1,
                  embed_dim=768, depth=12, num_heads=12, mlp_ratio=4., qkv_bias=True,
-                 drop_rate=0., attn_drop_rate=0.):
+                 drop_rate=0., attn_drop_rate=0.): # Các giá trị default này sẽ được override bởi params từ MODEL_CONFIGS
         super().__init__()
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim
@@ -171,16 +188,12 @@ class VisionTransformer(nn.Module):
         nn.init.trunc_normal_(self.pos_embed, std=.02)
         nn.init.trunc_normal_(self.cls_token, std=.02)
         self.apply(self._init_weights)
-
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
+            if m.bias is not None: nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
+            nn.init.constant_(m.bias, 0); nn.init.constant_(m.weight, 1.0)
     def forward_features(self, x):
         B = x.shape[0]
         x = self.patch_embed(x)
@@ -188,24 +201,22 @@ class VisionTransformer(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embed
         x = self.pos_drop(x)
-        for blk in self.blocks:
-            x = blk(x)
+        for blk in self.blocks: x = blk(x)
         x = self.norm(x)
         return x[:, 0]
-
     def forward(self, x):
-        x = self.forward_features(x)
-        x = self.head(x)
+        x = self.forward_features(x); x = self.head(x)
         return x
 
-# --- Định Nghĩa Mô Hình CNN (Giữ nguyên) ---
+# --- Định Nghĩa Mô Hình CNN (Giống notebook Kaggle, tham số hóa) ---
 class AudioCNN(nn.Module):
     def __init__(self, num_classes=1, dropout_rate=0.4,
-                 channels_list=None, fc_nodes_list=None,
+                 channels_list=None, fc_nodes_list=None, # Đổi tên để khớp MODEL_CONFIGS
                  n_mels=N_MELS, max_frames_spec=MAX_FRAMES_SPEC):
         super(AudioCNN, self).__init__()
-        if channels_list is None: channels_list = [32, 64, 128, 256]
-        if fc_nodes_list is None: fc_nodes_list = [512, 128]
+        # Sử dụng params từ MODEL_CONFIGS, nếu không có thì dùng default
+        self.channels_list = channels_list if channels_list is not None else [32, 64, 128, 256]
+        self.fc_nodes_list = fc_nodes_list if fc_nodes_list is not None else [512, 128]
 
         self.conv_layers = nn.ModuleList()
         self.bn_conv_layers = nn.ModuleList()
@@ -213,21 +224,22 @@ class AudioCNN(nn.Module):
         self.drop_conv_layers = nn.ModuleList()
         in_channels = 1
         current_height, current_width = n_mels, max_frames_spec
-        for i, out_channels in enumerate(channels_list):
+        for i, out_channels in enumerate(self.channels_list):
             self.conv_layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=1, padding=1))
             self.bn_conv_layers.append(nn.BatchNorm2d(out_channels))
             self.pool_layers.append(nn.MaxPool2d(kernel_size=2))
-            current_dropout_rate = dropout_rate / 2 if i < len(channels_list) / 2 else dropout_rate
+            current_dropout_rate = dropout_rate / 2 if i < len(self.channels_list) / 2 else dropout_rate
             self.drop_conv_layers.append(nn.Dropout2d(current_dropout_rate))
             in_channels = out_channels
             current_height //= 2
             current_width //= 2
-        fc_in_features = channels_list[-1] * current_height * current_width
+
+        fc_in_features = self.channels_list[-1] * current_height * current_width
         self.fc_layers = nn.ModuleList()
         self.bn_fc_layers = nn.ModuleList()
         self.drop_fc_layers = nn.ModuleList()
         current_fc_in_dim = fc_in_features
-        for i, fc_out_dim in enumerate(fc_nodes_list):
+        for i, fc_out_dim in enumerate(self.fc_nodes_list):
             self.fc_layers.append(nn.Linear(current_fc_in_dim, fc_out_dim))
             self.bn_fc_layers.append(nn.BatchNorm1d(fc_out_dim))
             self.drop_fc_layers.append(nn.Dropout(dropout_rate))
@@ -238,19 +250,19 @@ class AudioCNN(nn.Module):
         for i in range(len(self.conv_layers)):
             x = self.conv_layers[i](x)
             x = self.bn_conv_layers[i](x)
-            x = F.relu(x)
+            x = F.relu(x) # Sử dụng F.relu
             x = self.pool_layers[i](x)
             x = self.drop_conv_layers[i](x)
         x = x.view(x.size(0), -1)
         for i in range(len(self.fc_layers)):
             x = self.fc_layers[i](x)
             x = self.bn_fc_layers[i](x)
-            x = F.relu(x)
+            x = F.relu(x) # Sử dụng F.relu
             x = self.drop_fc_layers[i](x)
         x = self.output_fc(x)
         return x
 
-# --- Hàm Tiền Xử Lý Âm Thanh (Giữ nguyên) ---
+# --- Hàm Tiền Xử Lý Âm Thanh (Giữ nguyên từ code bạn cung cấp cho local) ---
 def audio_to_melspectrogram(audio_data_source, sr=SR, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS, max_frames=MAX_FRAMES_SPEC, fmin=FMIN, fmax=FMAX):
     try:
         y, sr_orig = None, sr
@@ -263,70 +275,66 @@ def audio_to_melspectrogram(audio_data_source, sr=SR, n_fft=N_FFT, hop_length=HO
         else:
             raise ValueError("audio_data_source phải là bytes hoặc đường dẫn file (str/Path).")
 
-        if y.ndim > 1: y = librosa.to_mono(y.T if y.shape[0] > y.shape[1] else y)
+        if y.ndim > 1: y = librosa.to_mono(y.T if y.shape[0] > y.shape[1] else y) # Đảm bảo đúng chiều
         if sr_orig != sr: y = librosa.resample(y, orig_sr=sr_orig, target_sr=sr)
         mel = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels, fmin=fmin, fmax=fmax if fmax is not None else sr/2.0)
         log_mel = librosa.power_to_db(mel, ref=np.max)
         curr_frames = log_mel.shape[1]
         if curr_frames < max_frames:
-            pad_val = log_mel.min()
+            pad_val = log_mel.min() # Có thể dùng 0 hoặc giá trị cụ thể
             pad_width = max_frames - curr_frames
             return np.pad(log_mel, ((0, 0), (0, pad_width)), mode='constant', constant_values=pad_val)
         elif curr_frames > max_frames:
             return log_mel[:, :max_frames]
         return log_mel
-    except FileNotFoundError as e_fnf: # Bắt lỗi FileNotFoundError cụ thể
+    except FileNotFoundError as e_fnf:
         raise HTTPException(status_code=404, detail=str(e_fnf))
     except Exception as e:
-        # Ghi log chi tiết hơn ở server nếu cần cho việc debug
-        # print(f"DEBUG audio_to_melspectrogram error: {type(e).__name__} - {e}")
-        raise HTTPException(status_code=400, detail=f"Lỗi xử lý âm thanh: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Lỗi xử lý âm thanh: {type(e).__name__} - {str(e)}")
 
 
 # --- Khởi tạo và Tải Tất Cả Models từ Local Path ---
 LOADED_MODELS: Dict[str, Optional[nn.Module]] = {}
 
 print("Bắt đầu khởi tạo và tải models từ thư mục cục bộ...")
-MODEL_TRAINED_DIR.mkdir(parents=True, exist_ok=True) # Đảm bảo thư mục model_trained tồn tại
-
 for model_key, config in MODEL_CONFIGS.items():
     print(f"\n--- Xử lý model: {config['name']} ({model_key}) ---")
     model_instance = None
-    local_model_file = config["local_path"]
+    local_model_file: Path = config["local_path"] # local_path đã là Path object
 
     if not local_model_file.exists():
-        print(f"CẢNH BÁO: File model {local_model_file} không tìm thấy. Bỏ qua model này.")
+        print(f"CẢNH BÁO: File model {local_model_file.resolve()} không tìm thấy. Model này sẽ không khả dụng.")
         LOADED_MODELS[model_key] = None
-        continue # Bỏ qua model này nếu file không tồn tại
+        continue
 
     try:
         if config["type"] == "ViT":
             params = config["params"]
             model_instance = VisionTransformer(
                 img_size=(N_MELS, MAX_FRAMES_SPEC),
-                patch_size=params["patch_size"],
+                patch_size=params["patch_size"], # Đã có trong params
                 in_chans=3, num_classes=1,
                 embed_dim=params["embed_dim"],
                 depth=params["depth"],
                 num_heads=params["num_heads"],
                 mlp_ratio=params["mlp_ratio"],
-                qkv_bias=True,
-                drop_rate=params["drop_rate"],
-                attn_drop_rate=params["attn_drop_rate"]
+                qkv_bias=True, # Giữ như notebook
+                drop_rate=params["drop_rate"], # Đã có trong params
+                attn_drop_rate=params["attn_drop_rate"] # Đã có trong params
             ).to(DEVICE)
         elif config["type"] == "CNN":
             params = config["params"]
             model_instance = AudioCNN(
                 num_classes=1,
                 dropout_rate=params["dropout_rate"],
-                channels_list=params["channels"],
-                fc_nodes_list=params["fc_nodes"],
+                channels_list=params["channels"], # Đổi tên key cho khớp
+                fc_nodes_list=params["fc_nodes"],   # Đổi tên key cho khớp
                 n_mels=N_MELS,
                 max_frames_spec=MAX_FRAMES_SPEC
             ).to(DEVICE)
-        
+
         if model_instance:
-            print(f"Đang tải trọng số cho {config['name']} từ {local_model_file}...")
+            print(f"Đang tải trọng số cho {config['name']} từ {local_model_file.resolve()}...")
             model_instance.load_state_dict(torch.load(local_model_file, map_location=DEVICE))
             model_instance.eval()
             LOADED_MODELS[model_key] = model_instance
@@ -336,163 +344,193 @@ for model_key, config in MODEL_CONFIGS.items():
             LOADED_MODELS[model_key] = None
 
     except Exception as e:
-        print(f"Lỗi khi tải hoặc khởi tạo model {config['name']} từ {local_model_file}: {str(e)}")
+        print(f"Lỗi khi tải hoặc khởi tạo model {config['name']} từ {local_model_file.resolve()}: {type(e).__name__} - {str(e)}")
         LOADED_MODELS[model_key] = None
 
 available_model_keys = [key for key, model in LOADED_MODELS.items() if model is not None]
 if not available_model_keys:
     print("\nCẢNH BÁO NGHIÊM TRỌNG: Không có model nào được tải thành công từ thư mục cục bộ!")
-    print(f"Vui lòng kiểm tra thư mục '{MODEL_TRAINED_DIR.resolve()}' và đảm bảo các file .pth có tên đúng và hợp lệ.")
+    print(f"Vui lòng kiểm tra thư mục '{MODEL_TRAINED_DIR.resolve()}' và đảm bảo các file .pth có tên đúng, hợp lệ và khớp với MODEL_CONFIGS.")
 else:
     print(f"\nCác model khả dụng đã được tải từ local: {available_model_keys}")
+    if len(available_model_keys) < len(MODEL_CONFIGS):
+        unavailable = [key for key in MODEL_CONFIGS if key not in available_model_keys]
+        print(f"Các model KHÔNG khả dụng (do lỗi hoặc file không tìm thấy): {unavailable}")
 
 
-# --- Pydantic Model Cho Response (Giữ nguyên) ---
+# --- Pydantic Model Cho Response ---
 class PredictionResponse(BaseModel):
-    model_key: str
-    model_name: str
-    ket_qua: str
-    xac_suat_gia: float
-    error: Optional[str] = None
+    model_key: str        # e.g., "vit_small"
+    model_name: str       # e.g., "ViT Small (Local)"
+    ket_qua: str          # "Thật" hoặc "Giả" hoặc "Lỗi"
+    xac_suat_gia: float   # Từ 0.0 đến 1.0, hoặc -1.0 nếu lỗi
+    error: Optional[str] = None # Thông báo lỗi chi tiết nếu có
 
-# --- Trang Chủ (Frontend) (Giữ nguyên, sử dụng model_options từ available_model_keys) ---
+# --- Trang Chủ (Frontend) ---
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    model_options = []
-    if available_model_keys: # Chỉ tạo options nếu có model khả dụng
-        model_options = [{"key": key, "name": MODEL_CONFIGS[key]["name"]} for key in available_model_keys]
-    return templates.TemplateResponse("index.html", {"request": request, "model_options": model_options})
+    # Tạo danh sách model cho dropdown/checkbox trên UI
+    model_options_for_ui = []
+    if available_model_keys:
+        for key in available_model_keys:
+            if key in MODEL_CONFIGS: # Đảm bảo key có trong config
+                 model_options_for_ui.append({"key": key, "name": MODEL_CONFIGS[key]["name"]})
+            else: # Trường hợp hy hữu key có trong LOADED_MODELS nhưng không có trong MODEL_CONFIGS
+                 model_options_for_ui.append({"key": key, "name": f"Model Key: {key} (Không có config tên)"})
 
-# --- API Endpoint Cho Form HTML (Giữ nguyên) ---
+    # Nếu không có model nào, vẫn trả về trang nhưng có thể hiển thị thông báo
+    return templates.TemplateResponse("index.html", {"request": request, "model_options": model_options_for_ui})
+
+# --- API Endpoint Cho Form HTML ---
 @app.post("/predict/", response_class=HTMLResponse)
 async def predict_audio_from_form(
     request: Request,
     file: UploadFile = File(...),
-    selected_models: List[str] = Form(...)
+    selected_models: List[str] = Form([]) # Mặc định là list rỗng nếu không có gì được chọn
 ):
+    model_options_for_ui = [{"key": k, "name": MODEL_CONFIGS[k]["name"]} for k in available_model_keys if k in MODEL_CONFIGS]
+
     if not file.filename.endswith((".wav", ".mp3", ".flac")):
-        # Lấy lại model_options để hiển thị lại form đúng cách
-        model_opts_for_error = [{"key": key, "name": MODEL_CONFIGS[key]["name"]} for key in available_model_keys]
-        return templates.TemplateResponse("index.html", {"request": request, "error": "Vui lòng tải lên file WAV, MP3 hoặc FLAC.", "model_options": model_opts_for_error})
+        return templates.TemplateResponse(
+            "index.html",
+            {"request": request, "error": "Vui lòng tải lên file WAV, MP3 hoặc FLAC.", "model_options": model_options_for_ui}
+        )
+
+    if not selected_models:
+        return templates.TemplateResponse(
+            "index.html",
+            {"request": request, "error": "Vui lòng chọn ít nhất một model để dự đoán.",
+             "model_options": model_options_for_ui, "filename": file.filename} # Giữ lại filename
+        )
 
     audio_data = await file.read()
     try:
         mel_spec = audio_to_melspectrogram(audio_data)
     except HTTPException as e:
-        model_opts_for_error = [{"key": key, "name": MODEL_CONFIGS[key]["name"]} for key in available_model_keys]
-        return templates.TemplateResponse("index.html", {"request": request, "error": str(e.detail), "model_options": model_opts_for_error})
-
-    mean = np.mean(mel_spec); std = np.std(mel_spec)
-    mel_spec_normalized = (mel_spec - mean) / (std + NORM_EPSILON)
-    
-    results = []
-
-    if not selected_models:
-         model_opts_for_error = [{"key": key, "name": MODEL_CONFIGS[key]["name"]} for key in available_model_keys]
-         return templates.TemplateResponse(
+        return templates.TemplateResponse(
             "index.html",
-            {"request": request, "error": "Vui lòng chọn ít nhất một model để dự đoán.",
-             "model_options": model_opts_for_error}
+            {"request": request, "error": str(e.detail), "model_options": model_options_for_ui, "filename": file.filename}
+        )
+    except Exception as e_gen: # Bắt lỗi chung khác từ audio_to_melspectrogram
+        return templates.TemplateResponse(
+            "index.html",
+            {"request": request, "error": f"Lỗi chung khi xử lý audio: {str(e_gen)}", "model_options": model_options_for_ui, "filename": file.filename}
         )
 
+
+    mean = np.mean(mel_spec); std = np.std(mel_spec)
+    if std < NORM_EPSILON: std = NORM_EPSILON # Tránh chia cho 0
+    mel_spec_normalized = (mel_spec - mean) / std
+
+    results_for_template: List[Dict[str, Any]] = [] # Sử dụng Dict để truyền cho template
+
     for model_key in selected_models:
+        prediction_data: Dict[str, Any] = { # Khởi tạo với các giá trị mặc định
+            "model_key": model_key,
+            "model_name": "Không xác định",
+            "ket_qua": "Lỗi",
+            "xac_suat_gia": -1.0,
+            "error": None
+        }
+
         if model_key not in MODEL_CONFIGS:
-            results.append(PredictionResponse(
-                model_key=model_key, model_name="Không xác định", ket_qua="Lỗi", xac_suat_gia=-1.0,
-                error=f"Model key '{model_key}' không hợp lệ."
-            ))
+            prediction_data["error"] = f"Model key '{model_key}' không hợp lệ."
+            results_for_template.append(prediction_data)
             continue
 
         model_config = MODEL_CONFIGS[model_key]
+        prediction_data["model_name"] = model_config["name"]
         model_instance = LOADED_MODELS.get(model_key)
 
         if model_instance is None:
-            results.append(PredictionResponse(
-                model_key=model_key, model_name=model_config["name"], ket_qua="Lỗi", xac_suat_gia=-1.0,
-                error=f"Model '{model_config['name']}' không khả dụng (chưa được tải hoặc lỗi)."
-            ))
+            prediction_data["error"] = f"Model '{model_config['name']}' không khả dụng (chưa được tải hoặc lỗi)."
+            results_for_template.append(prediction_data)
             continue
-        
+
         try:
             if model_config["type"] == "ViT":
                 mel_spec_input = np.stack([mel_spec_normalized]*3, axis=0)
             else: # CNN
                 mel_spec_input = np.expand_dims(mel_spec_normalized, axis=0)
-            
+
+            # Tạo tensor (batch_size=1, channels, height, width)
             mel_spec_tensor = torch.tensor(mel_spec_input, dtype=torch.float32).unsqueeze(0).to(DEVICE)
-            
+
             with torch.no_grad():
                 output = model_instance(mel_spec_tensor)
                 prob = torch.sigmoid(output).item()
                 prediction_label = "Giả" if prob > 0.5 else "Thật"
-                results.append(PredictionResponse(
-                    model_key=model_key, model_name=model_config["name"],
-                    ket_qua=prediction_label, xac_suat_gia=prob
-                ))
-        except Exception as e:
-            print(f"Lỗi khi dự đoán với model {model_config['name']} ({model_key}): {e}")
-            results.append(PredictionResponse(
-                model_key=model_key, model_name=model_config["name"], ket_qua="Lỗi", xac_suat_gia=-1.0,
-                error=f"Lỗi dự đoán: {str(e)[:100]}..."
-            ))
 
-    model_opts_for_display = [{"key": key, "name": MODEL_CONFIGS[key]["name"]} for key in available_model_keys]
+                prediction_data["ket_qua"] = prediction_label
+                prediction_data["xac_suat_gia"] = prob
+        except Exception as e:
+            error_msg = f"Lỗi dự đoán: {type(e).__name__} - {str(e)[:100]}..."
+            print(f"Lỗi khi dự đoán với model {model_config['name']} ({model_key}): {e}") # Log chi tiết ở server
+            prediction_data["error"] = error_msg
+        
+        results_for_template.append(prediction_data)
+
     return templates.TemplateResponse("index.html", {
-        "request": request, "predictions": results, "filename": file.filename,
-        "model_options": model_opts_for_display, "selected_models_keys": selected_models
+        "request": request, "predictions": results_for_template, "filename": file.filename,
+        "model_options": model_options_for_ui, "selected_models_keys": selected_models
     })
 
 
-# --- API Endpoint Cho Client (Giữ nguyên) ---
+# --- API Endpoint Cho Client (Dùng Query cho model_keys) ---
 @app.post("/api/predict/", response_model=List[PredictionResponse])
 async def api_predict(
     file: UploadFile = File(...),
-    model_keys: List[str] = Query(..., description="Danh sách các model key để dự đoán (vd: vit_small, cnn_large)")
+    model_keys: List[str] = Query(..., description="Danh sách các model key để dự đoán (vd: vit_small, cnn_large)") # ... nghĩa là bắt buộc
 ):
     if not file.filename.endswith((".wav", ".mp3", ".flac")):
         raise HTTPException(status_code=400, detail="Vui lòng tải lên file WAV, MP3 hoặc FLAC.")
     audio_data = await file.read()
     try:
         mel_spec = audio_to_melspectrogram(audio_data)
-    except HTTPException as e:
+    except HTTPException as e: # Lỗi đã được wrap trong HTTPException từ audio_to_melspectrogram
         raise e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi không xác định khi xử lý âm thanh: {str(e)}")
+    except Exception as e: # Bắt các lỗi khác nếu có
+        raise HTTPException(status_code=500, detail=f"Lỗi không xác định khi xử lý âm thanh: {type(e).__name__} - {str(e)}")
 
     mean = np.mean(mel_spec); std = np.std(mel_spec)
-    mel_spec_normalized = (mel_spec - mean) / (std + NORM_EPSILON)
-    
-    results = []
+    if std < NORM_EPSILON: std = NORM_EPSILON
+    mel_spec_normalized = (mel_spec - mean) / std
 
-    if not model_keys:
+    results: List[PredictionResponse] = []
+
+    if not model_keys: # Query(...,) đã đảm bảo không rỗng, nhưng kiểm tra lại cho chắc
         raise HTTPException(status_code=400, detail="Vui lòng cung cấp ít nhất một 'model_keys'.")
 
     for model_key in model_keys:
+        model_name_default = "Không xác định"
+        error_message = None
+
         if model_key not in MODEL_CONFIGS:
+            error_message = f"Model key '{model_key}' không hợp lệ."
             results.append(PredictionResponse(
-                model_key=model_key, model_name="Không xác định", ket_qua="Lỗi", xac_suat_gia=-1.0,
-                error=f"Model key '{model_key}' không hợp lệ."
+                model_key=model_key, model_name=model_name_default, ket_qua="Lỗi", xac_suat_gia=-1.0, error=error_message
             ))
             continue
 
         model_config = MODEL_CONFIGS[model_key]
+        model_name_default = model_config["name"] # Cập nhật tên model
         model_instance = LOADED_MODELS.get(model_key)
 
         if model_instance is None:
+            error_message = f"Model '{model_config['name']}' không khả dụng (chưa được tải hoặc lỗi)."
             results.append(PredictionResponse(
-                model_key=model_key, model_name=model_config["name"], ket_qua="Lỗi", xac_suat_gia=-1.0,
-                error=f"Model '{model_config['name']}' không khả dụng (chưa được tải hoặc lỗi)."
+                model_key=model_key, model_name=model_name_default, ket_qua="Lỗi", xac_suat_gia=-1.0, error=error_message
             ))
             continue
-        
+
         try:
             if model_config["type"] == "ViT":
                 mel_spec_input = np.stack([mel_spec_normalized]*3, axis=0)
             else: # CNN
                 mel_spec_input = np.expand_dims(mel_spec_normalized, axis=0)
-            
+
             mel_spec_tensor = torch.tensor(mel_spec_input, dtype=torch.float32).unsqueeze(0).to(DEVICE)
-            
+
             with torch.no_grad():
                 output = model_instance(mel_spec_tensor)
                 prob = torch.sigmoid(output).item()
@@ -502,22 +540,26 @@ async def api_predict(
                     ket_qua=prediction_label, xac_suat_gia=prob
                 ))
         except Exception as e:
+            error_msg_detail = f"Lỗi khi dự đoán với {model_config['name']}: {type(e).__name__} - {str(e)[:100]}..."
             print(f"Lỗi API khi dự đoán với model {model_config['name']} ({model_key}): {e}")
             results.append(PredictionResponse(
                 model_key=model_key, model_name=model_config["name"], ket_qua="Lỗi", xac_suat_gia=-1.0,
-                error=f"Lỗi khi dự đoán với {model_config['name']}: {str(e)[:100]}..."
+                error=error_msg_detail
             ))
-            
+
     return results
 
 # --- Chạy Local Server ---
 if __name__ == "__main__":
     import uvicorn
-    # Không cần tạo thư mục models_cache nữa vì chúng ta load từ MODEL_TRAINED_DIR
     if not MODEL_TRAINED_DIR.exists() or not MODEL_TRAINED_DIR.is_dir():
         print(f"CẢNH BÁO: Thư mục model huấn luyện '{MODEL_TRAINED_DIR.resolve()}' không tồn tại hoặc không phải là thư mục.")
-        print("Các model có thể sẽ không được tải. Vui lòng tạo thư mục và đặt các file .pth vào đó.")
-    
-    print("Chạy uvicorn server cục bộ trên http://0.0.0.0:8000")
+        print("Ứng dụng sẽ chạy, nhưng các model có thể sẽ không được tải.")
+        print(f"Vui lòng tạo thư mục '{MODEL_TRAINED_DIR.name}' và đặt các file .pth (ví dụ: best_vit_small_model.pth) vào đó.")
+
+    if not available_model_keys:
+         print("CẢNH BÁO: Không có model nào khả dụng sau khi khởi tạo. Giao diện dự đoán sẽ không có lựa chọn model.")
+
+    print("\nChạy uvicorn server cục bộ trên http://0.0.0.0:8000")
     print("Truy cập http://localhost:8000 để xem giao diện.")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False) # reload=True nếu muốn tự động load lại khi code thay đổi
