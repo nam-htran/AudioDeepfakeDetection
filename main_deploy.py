@@ -13,24 +13,19 @@ from pydantic import BaseModel
 import io
 import soundfile as sf
 from pathlib import Path
-from typing import Dict, Optional, List, Any # Thêm Any
+from typing import Dict, Optional, List, Any
 
 # --- FastAPI App ---
 app = FastAPI(title="Phân Loại Âm Thanh Deepfake (Local - Models từ Thư mục)",
               description="API và giao diện phân loại âm thanh thật/giả")
 
-# --- Mount static files và templates ---
-# Đảm bảo bạn có thư mục 'static' và 'templates' cùng cấp với main_deploy.py
-# và file 'index.html' nằm trong 'templates', 'styles.css' (nếu có) trong 'static'
 STATIC_DIR = Path("./static")
 TEMPLATES_DIR = Path("./templates")
 if not STATIC_DIR.exists() or not TEMPLATES_DIR.exists():
     print(f"CẢNH BÁO: Thư mục 'static' ({STATIC_DIR.resolve()}) hoặc 'templates' ({TEMPLATES_DIR.resolve()}) không tồn tại.")
     print("Giao diện có thể không hoạt động đúng.")
-    # Tạo thư mục mẫu nếu chưa có để tránh lỗi FastAPI, nhưng bạn cần thêm file thực tế
     STATIC_DIR.mkdir(parents=True, exist_ok=True)
     TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
-    # Tạo file index.html mẫu nếu chưa có
     sample_index_html_path = TEMPLATES_DIR / "index.html"
     if not sample_index_html_path.exists():
         with open(sample_index_html_path, "w", encoding="utf-8") as f:
@@ -47,18 +42,16 @@ SR = 16000
 N_FFT = 2048
 HOP_LENGTH = 512
 N_MELS = 128
-MAX_FRAMES_SPEC = 313 # Giữ nguyên từ notebook
+MAX_FRAMES_SPEC = 313
 FMIN = 0.0
 FMAX = None # Sẽ là sr/2
 NORM_EPSILON = 1e-6
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
 
-# --- Đường dẫn đến thư mục chứa các model đã huấn luyện ---
-MODEL_TRAINED_DIR = Path("./model_trained") # Đảm bảo thư mục này tồn tại và chứa các file .pth
-MODEL_TRAINED_DIR.mkdir(parents=True, exist_ok=True) # Tạo thư mục nếu chưa có
+MODEL_TRAINED_DIR = Path("./model_trained")
+MODEL_TRAINED_DIR.mkdir(parents=True, exist_ok=True) 
 
-# --- CẤU HÌNH CHO 6 MODELS (Giả định file .pth nằm trong MODEL_TRAINED_DIR) ---
 MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
     "vit_small": {
         "name": "ViT Small (Local)",
@@ -98,7 +91,7 @@ MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
     }
 }
 
-# --- Định Nghĩa Mô Hình ViT (Giống code bạn cung cấp, khớp với notebook Kaggle) ---
+# --- Định Nghĩa Mô Hình ViT ---
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=(N_MELS, MAX_FRAMES_SPEC), patch_size=16, in_chans=3, embed_dim=768):
         super().__init__()
@@ -110,15 +103,12 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         B, C, H, W = x.shape
-        # Thêm kiểm tra kích thước nếu cần, hoặc đảm bảo đầu vào luôn đúng
-        # if H != self.img_size[0] or W != self.img_size[1]:
-        #     print(f"Warning: Input HxW {H}x{W} not matching model HxW {self.img_size[0]}x{self.img_size[1]}")
         x = self.proj(x)
         x = x.flatten(2)
         x = x.transpose(1, 2)
         return x
 
-class Attention(nn.Module): # Giữ nguyên
+class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
@@ -140,7 +130,7 @@ class Attention(nn.Module): # Giữ nguyên
         x = self.proj_drop(x)
         return x
 
-class Mlp(nn.Module): # Giữ nguyên
+class Mlp(nn.Module):
     def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
         super().__init__()
         out_features = out_features or in_features
@@ -154,7 +144,7 @@ class Mlp(nn.Module): # Giữ nguyên
         x = self.fc2(x); x = self.drop(x)
         return x
 
-class Block(nn.Module): # Giữ nguyên
+class Block(nn.Module): 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
         self.norm1 = norm_layer(dim)
@@ -167,11 +157,10 @@ class Block(nn.Module): # Giữ nguyên
         x = x + self.mlp(self.norm2(x))
         return x
 
-class VisionTransformer(nn.Module): # Giữ nguyên từ notebook (tham số hóa)
+class VisionTransformer(nn.Module): 
     def __init__(self, img_size=(N_MELS, MAX_FRAMES_SPEC), patch_size=16, in_chans=3, num_classes=1,
                  embed_dim=768, depth=12, num_heads=12, mlp_ratio=4., qkv_bias=True,
-                 drop_rate=0., attn_drop_rate=0.): # Các giá trị default này sẽ được override bởi params từ MODEL_CONFIGS
-        super().__init__()
+                 drop_rate=0., attn_drop_rate=0.):
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim
         self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
@@ -208,13 +197,12 @@ class VisionTransformer(nn.Module): # Giữ nguyên từ notebook (tham số hó
         x = self.forward_features(x); x = self.head(x)
         return x
 
-# --- Định Nghĩa Mô Hình CNN (Giống notebook Kaggle, tham số hóa) ---
+# --- Định Nghĩa Mô Hình CNN ---
 class AudioCNN(nn.Module):
     def __init__(self, num_classes=1, dropout_rate=0.4,
-                 channels_list=None, fc_nodes_list=None, # Đổi tên để khớp MODEL_CONFIGS
+                 channels_list=None, fc_nodes_list=None,
                  n_mels=N_MELS, max_frames_spec=MAX_FRAMES_SPEC):
         super(AudioCNN, self).__init__()
-        # Sử dụng params từ MODEL_CONFIGS, nếu không có thì dùng default
         self.channels_list = channels_list if channels_list is not None else [32, 64, 128, 256]
         self.fc_nodes_list = fc_nodes_list if fc_nodes_list is not None else [512, 128]
 
@@ -250,38 +238,38 @@ class AudioCNN(nn.Module):
         for i in range(len(self.conv_layers)):
             x = self.conv_layers[i](x)
             x = self.bn_conv_layers[i](x)
-            x = F.relu(x) # Sử dụng F.relu
+            x = F.relu(x) 
             x = self.pool_layers[i](x)
             x = self.drop_conv_layers[i](x)
         x = x.view(x.size(0), -1)
         for i in range(len(self.fc_layers)):
             x = self.fc_layers[i](x)
             x = self.bn_fc_layers[i](x)
-            x = F.relu(x) # Sử dụng F.relu
+            x = F.relu(x) 
             x = self.drop_fc_layers[i](x)
         x = self.output_fc(x)
         return x
 
-# --- Hàm Tiền Xử Lý Âm Thanh (Giữ nguyên từ code bạn cung cấp cho local) ---
+# --- Hàm Tiền Xử Lý Âm Thanh ---
 def audio_to_melspectrogram(audio_data_source, sr=SR, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS, max_frames=MAX_FRAMES_SPEC, fmin=FMIN, fmax=FMAX):
     try:
         y, sr_orig = None, sr
         if isinstance(audio_data_source, bytes):
             y, sr_orig = sf.read(io.BytesIO(audio_data_source))
-        elif isinstance(audio_data_source, (str, Path)): # Chấp nhận cả str và Path
-            if not Path(audio_data_source).exists(): # Kiểm tra file tồn tại
+        elif isinstance(audio_data_source, (str, Path)):
+            if not Path(audio_data_source).exists():
                  raise FileNotFoundError(f"File không tìm thấy: {audio_data_source}")
-            y, sr_orig = sf.read(str(audio_data_source)) # sf.read cần string
+            y, sr_orig = sf.read(str(audio_data_source))
         else:
             raise ValueError("audio_data_source phải là bytes hoặc đường dẫn file (str/Path).")
 
-        if y.ndim > 1: y = librosa.to_mono(y.T if y.shape[0] > y.shape[1] else y) # Đảm bảo đúng chiều
+        if y.ndim > 1: y = librosa.to_mono(y.T if y.shape[0] > y.shape[1] else y)
         if sr_orig != sr: y = librosa.resample(y, orig_sr=sr_orig, target_sr=sr)
         mel = librosa.feature.melspectrogram(y=y, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels, fmin=fmin, fmax=fmax if fmax is not None else sr/2.0)
         log_mel = librosa.power_to_db(mel, ref=np.max)
         curr_frames = log_mel.shape[1]
         if curr_frames < max_frames:
-            pad_val = log_mel.min() # Có thể dùng 0 hoặc giá trị cụ thể
+            pad_val = log_mel.min()
             pad_width = max_frames - curr_frames
             return np.pad(log_mel, ((0, 0), (0, pad_width)), mode='constant', constant_values=pad_val)
         elif curr_frames > max_frames:
@@ -300,7 +288,7 @@ print("Bắt đầu khởi tạo và tải models từ thư mục cục bộ..."
 for model_key, config in MODEL_CONFIGS.items():
     print(f"\n--- Xử lý model: {config['name']} ({model_key}) ---")
     model_instance = None
-    local_model_file: Path = config["local_path"] # local_path đã là Path object
+    local_model_file: Path = config["local_path"]
 
     if not local_model_file.exists():
         print(f"CẢNH BÁO: File model {local_model_file.resolve()} không tìm thấy. Model này sẽ không khả dụng.")
@@ -312,23 +300,23 @@ for model_key, config in MODEL_CONFIGS.items():
             params = config["params"]
             model_instance = VisionTransformer(
                 img_size=(N_MELS, MAX_FRAMES_SPEC),
-                patch_size=params["patch_size"], # Đã có trong params
+                patch_size=params["patch_size"],
                 in_chans=3, num_classes=1,
                 embed_dim=params["embed_dim"],
                 depth=params["depth"],
                 num_heads=params["num_heads"],
                 mlp_ratio=params["mlp_ratio"],
-                qkv_bias=True, # Giữ như notebook
-                drop_rate=params["drop_rate"], # Đã có trong params
-                attn_drop_rate=params["attn_drop_rate"] # Đã có trong params
+                qkv_bias=True,
+                drop_rate=params["drop_rate"],
+                attn_drop_rate=params["attn_drop_rate"]
             ).to(DEVICE)
         elif config["type"] == "CNN":
             params = config["params"]
             model_instance = AudioCNN(
                 num_classes=1,
                 dropout_rate=params["dropout_rate"],
-                channels_list=params["channels"], # Đổi tên key cho khớp
-                fc_nodes_list=params["fc_nodes"],   # Đổi tên key cho khớp
+                channels_list=params["channels"],
+                fc_nodes_list=params["fc_nodes"], 
                 n_mels=N_MELS,
                 max_frames_spec=MAX_FRAMES_SPEC
             ).to(DEVICE)
@@ -360,25 +348,23 @@ else:
 
 # --- Pydantic Model Cho Response ---
 class PredictionResponse(BaseModel):
-    model_key: str        # e.g., "vit_small"
-    model_name: str       # e.g., "ViT Small (Local)"
-    ket_qua: str          # "Thật" hoặc "Giả" hoặc "Lỗi"
-    xac_suat_gia: float   # Từ 0.0 đến 1.0, hoặc -1.0 nếu lỗi
-    error: Optional[str] = None # Thông báo lỗi chi tiết nếu có
+    model_key: str
+    model_name: str
+    ket_qua: str
+    xac_suat_gia: float
+    error: Optional[str] = None
 
 # --- Trang Chủ (Frontend) ---
 @app.get("/", response_class=HTMLResponse)
 async def home(request: Request):
-    # Tạo danh sách model cho dropdown/checkbox trên UI
     model_options_for_ui = []
     if available_model_keys:
         for key in available_model_keys:
-            if key in MODEL_CONFIGS: # Đảm bảo key có trong config
+            if key in MODEL_CONFIGS:
                  model_options_for_ui.append({"key": key, "name": MODEL_CONFIGS[key]["name"]})
-            else: # Trường hợp hy hữu key có trong LOADED_MODELS nhưng không có trong MODEL_CONFIGS
+            else:
                  model_options_for_ui.append({"key": key, "name": f"Model Key: {key} (Không có config tên)"})
 
-    # Nếu không có model nào, vẫn trả về trang nhưng có thể hiển thị thông báo
     return templates.TemplateResponse("index.html", {"request": request, "model_options": model_options_for_ui})
 
 # --- API Endpoint Cho Form HTML ---
@@ -386,7 +372,7 @@ async def home(request: Request):
 async def predict_audio_from_form(
     request: Request,
     file: UploadFile = File(...),
-    selected_models: List[str] = Form([]) # Mặc định là list rỗng nếu không có gì được chọn
+    selected_models: List[str] = Form([])
 ):
     model_options_for_ui = [{"key": k, "name": MODEL_CONFIGS[k]["name"]} for k in available_model_keys if k in MODEL_CONFIGS]
 
@@ -400,7 +386,7 @@ async def predict_audio_from_form(
         return templates.TemplateResponse(
             "index.html",
             {"request": request, "error": "Vui lòng chọn ít nhất một model để dự đoán.",
-             "model_options": model_options_for_ui, "filename": file.filename} # Giữ lại filename
+             "model_options": model_options_for_ui, "filename": file.filename}
         )
 
     audio_data = await file.read()
@@ -411,7 +397,7 @@ async def predict_audio_from_form(
             "index.html",
             {"request": request, "error": str(e.detail), "model_options": model_options_for_ui, "filename": file.filename}
         )
-    except Exception as e_gen: # Bắt lỗi chung khác từ audio_to_melspectrogram
+    except Exception as e_gen:
         return templates.TemplateResponse(
             "index.html",
             {"request": request, "error": f"Lỗi chung khi xử lý audio: {str(e_gen)}", "model_options": model_options_for_ui, "filename": file.filename}
@@ -419,13 +405,13 @@ async def predict_audio_from_form(
 
 
     mean = np.mean(mel_spec); std = np.std(mel_spec)
-    if std < NORM_EPSILON: std = NORM_EPSILON # Tránh chia cho 0
+    if std < NORM_EPSILON: std = NORM_EPSILON
     mel_spec_normalized = (mel_spec - mean) / std
 
-    results_for_template: List[Dict[str, Any]] = [] # Sử dụng Dict để truyền cho template
+    results_for_template: List[Dict[str, Any]] = []
 
     for model_key in selected_models:
-        prediction_data: Dict[str, Any] = { # Khởi tạo với các giá trị mặc định
+        prediction_data: Dict[str, Any] = {
             "model_key": model_key,
             "model_name": "Không xác định",
             "ket_qua": "Lỗi",
@@ -450,10 +436,9 @@ async def predict_audio_from_form(
         try:
             if model_config["type"] == "ViT":
                 mel_spec_input = np.stack([mel_spec_normalized]*3, axis=0)
-            else: # CNN
+            else:
                 mel_spec_input = np.expand_dims(mel_spec_normalized, axis=0)
 
-            # Tạo tensor (batch_size=1, channels, height, width)
             mel_spec_tensor = torch.tensor(mel_spec_input, dtype=torch.float32).unsqueeze(0).to(DEVICE)
 
             with torch.no_grad():
@@ -465,7 +450,7 @@ async def predict_audio_from_form(
                 prediction_data["xac_suat_gia"] = prob
         except Exception as e:
             error_msg = f"Lỗi dự đoán: {type(e).__name__} - {str(e)[:100]}..."
-            print(f"Lỗi khi dự đoán với model {model_config['name']} ({model_key}): {e}") # Log chi tiết ở server
+            print(f"Lỗi khi dự đoán với model {model_config['name']} ({model_key}): {e}")
             prediction_data["error"] = error_msg
         
         results_for_template.append(prediction_data)
@@ -476,20 +461,17 @@ async def predict_audio_from_form(
     })
 
 
-# --- API Endpoint Cho Client (Dùng Query cho model_keys) ---
+# --- API Endpoint Cho Client  ---
 @app.post("/api/predict/", response_model=List[PredictionResponse])
-async def api_predict(
-    file: UploadFile = File(...),
-    model_keys: List[str] = Query(..., description="Danh sách các model key để dự đoán (vd: vit_small, cnn_large)") # ... nghĩa là bắt buộc
-):
+async def api_predict(file: UploadFile = File(...), model_keys: List[str] = Query(..., description="Danh sách các model key để dự đoán (vd: vit_small, cnn_large)")):
     if not file.filename.endswith((".wav", ".mp3", ".flac")):
         raise HTTPException(status_code=400, detail="Vui lòng tải lên file WAV, MP3 hoặc FLAC.")
     audio_data = await file.read()
     try:
         mel_spec = audio_to_melspectrogram(audio_data)
-    except HTTPException as e: # Lỗi đã được wrap trong HTTPException từ audio_to_melspectrogram
+    except HTTPException as e:
         raise e
-    except Exception as e: # Bắt các lỗi khác nếu có
+    except Exception as e: 
         raise HTTPException(status_code=500, detail=f"Lỗi không xác định khi xử lý âm thanh: {type(e).__name__} - {str(e)}")
 
     mean = np.mean(mel_spec); std = np.std(mel_spec)
@@ -498,7 +480,7 @@ async def api_predict(
 
     results: List[PredictionResponse] = []
 
-    if not model_keys: # Query(...,) đã đảm bảo không rỗng, nhưng kiểm tra lại cho chắc
+    if not model_keys: 
         raise HTTPException(status_code=400, detail="Vui lòng cung cấp ít nhất một 'model_keys'.")
 
     for model_key in model_keys:
@@ -513,7 +495,7 @@ async def api_predict(
             continue
 
         model_config = MODEL_CONFIGS[model_key]
-        model_name_default = model_config["name"] # Cập nhật tên model
+        model_name_default = model_config["name"] 
         model_instance = LOADED_MODELS.get(model_key)
 
         if model_instance is None:
@@ -526,7 +508,7 @@ async def api_predict(
         try:
             if model_config["type"] == "ViT":
                 mel_spec_input = np.stack([mel_spec_normalized]*3, axis=0)
-            else: # CNN
+            else: 
                 mel_spec_input = np.expand_dims(mel_spec_normalized, axis=0)
 
             mel_spec_tensor = torch.tensor(mel_spec_input, dtype=torch.float32).unsqueeze(0).to(DEVICE)
@@ -562,4 +544,4 @@ if __name__ == "__main__":
 
     print("\nChạy uvicorn server cục bộ trên http://0.0.0.0:8000")
     print("Truy cập http://localhost:8000 để xem giao diện.")
-    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False) # reload=True nếu muốn tự động load lại khi code thay đổi
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
