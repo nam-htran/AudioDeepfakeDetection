@@ -44,7 +44,7 @@ HOP_LENGTH = 512
 N_MELS = 128
 MAX_FRAMES_SPEC = 313
 FMIN = 0.0
-FMAX = None # Sẽ là sr/2
+FMAX = None 
 NORM_EPSILON = 1e-6
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {DEVICE}")
@@ -157,32 +157,37 @@ class Block(nn.Module):
         x = x + self.mlp(self.norm2(x))
         return x
 
-class VisionTransformer(nn.Module): 
+class VisionTransformer(nn.Module):
     def __init__(self, img_size=(N_MELS, MAX_FRAMES_SPEC), patch_size=16, in_chans=3, num_classes=1,
                  embed_dim=768, depth=12, num_heads=12, mlp_ratio=4., qkv_bias=True,
                  drop_rate=0., attn_drop_rate=0.):
+        super().__init__()
         self.num_classes = num_classes
         self.num_features = self.embed_dim = embed_dim
-        self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
+        self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=self.embed_dim)
         num_patches = self.patch_embed.num_patches
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.embed_dim))
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, self.embed_dim))
         self.pos_drop = nn.Dropout(p=drop_rate)
         self.blocks = nn.ModuleList([
-            Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
+            Block(dim=self.embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
                   drop=drop_rate, attn_drop=attn_drop_rate)
             for _ in range(depth)])
-        self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes)
+        self.norm = nn.LayerNorm(self.embed_dim)
+        self.head = nn.Linear(self.embed_dim, num_classes)
         nn.init.trunc_normal_(self.pos_embed, std=.02)
         nn.init.trunc_normal_(self.cls_token, std=.02)
         self.apply(self._init_weights)
+
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
             nn.init.trunc_normal_(m.weight, std=.02)
-            if m.bias is not None: nn.init.constant_(m.bias, 0)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0); nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
     def forward_features(self, x):
         B = x.shape[0]
         x = self.patch_embed(x)
@@ -190,11 +195,14 @@ class VisionTransformer(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
         x = x + self.pos_embed
         x = self.pos_drop(x)
-        for blk in self.blocks: x = blk(x)
+        for blk in self.blocks:
+            x = blk(x)
         x = self.norm(x)
         return x[:, 0]
+
     def forward(self, x):
-        x = self.forward_features(x); x = self.head(x)
+        x = self.forward_features(x)
+        x = self.head(x)
         return x
 
 # --- Định Nghĩa Mô Hình CNN ---
