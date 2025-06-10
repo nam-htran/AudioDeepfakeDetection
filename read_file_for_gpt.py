@@ -3,11 +3,9 @@ import os
 def save_all_source_code(output_path='output.txt', excluded_dirs=None, excluded_files=None):
     if excluded_dirs is None:
         excluded_dirs = {
-            '__pycache__', '_dataset', '_logs', '_model_trained', '_results'
         }
     if excluded_files is None:
         excluded_files = {
-            output_path, '.gitignore', 'pyproject.toml', 'credentials.py', 'read_file_for_gpt.py', '.env'
         }
 
     file_count = 0

@@ -1,6 +1,0 @@
-pycache/ 
-*.pyc 
-venv/ 
-.env 
-*.log 
-main_local.ipynb

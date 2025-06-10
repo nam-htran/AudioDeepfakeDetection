@@ -1,767 +1,2635 @@
 
 ===== .\main_deploy.py =====
+# ===== main_deploy.py (Sử dụng model từ file .py export từ notebook) =====
 import os
-import numpy as np
-import librosa
+import io
+from pathlib import Path
+from typing import Dict, Optional, List, Any
+import logging
+
+import soundfile as sf
 import torch
 import torch.nn as nn
+import torch.nn.functional as F 
+import torchaudio.transforms as T
+
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-import io
-import soundfile as sf
-import requests # Thêm thư viện requests
-from pathlib import Path # Thêm Path
 
-# --- Training Flag ---
-IS_TRAINING = False
+# --- Thiết lập logging ---
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Import model custom từ các file Python đã export từ notebook ---
+try:
+    # CNN_Audio từ notebooks/cnn-trainer.py
+    from notebooks.cnn_trainer import CNN_Audio 
+    # ViT_Audio từ notebooks/vit-trainer.py
+    from notebooks.vit_trainer import ViT_Audio  
+    logger.info("Đã import CNN_Audio và ViT_Audio từ các file export từ notebook.")
+except ImportError as e:
+    logger.error(f"Lỗi import model: {e}. Đảm bảo các file cnn-trainer.py và vit-trainer.py tồn tại trong thư mục notebooks/ và chứa đúng định nghĩa lớp CNN_Audio/ViT_Audio. Đồng thời, kiểm tra các thư viện phụ thuộc (ví dụ: einops cho ViT_Audio).")
+    raise ImportError(f"Không thể import model: {e}. Vui lòng kiểm tra file và cài đặt.")
+except Exception as e: 
+    logger.error(f"Lỗi không xác định khi import model: {e}", exc_info=True)
+    raise
+
 
 # --- FastAPI App ---
-app = FastAPI(title="Phân Loại Âm Thanh Deepfake", description="API và giao diện phân loại âm thanh thật/giả")
+app = FastAPI(
+    title="Phân Loại Âm Thanh Deepfake (Custom Models from Notebook)",
+    description="API sử dụng model custom (CNN_Audio, ViT_Audio) từ notebook huấn luyện."
+)
 
-# --- Mount static files và templates ---
-app.mount("/static", StaticFiles(directory="static"), name="static")
-templates = Jinja2Templates(directory="templates")
+# --- Thiết lập thư mục và Template ---
+STATIC_DIR = Path("./static")
+TEMPLATES_DIR = Path("./templates")
+STATIC_DIR.mkdir(exist_ok=True); TEMPLATES_DIR.mkdir(exist_ok=True)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+templates = Jinja2Templates(directory=TEMPLATES_DIR)
 
-# --- Config ---
-SR = 16000
+# --- Đồng bộ CONFIG (Dựa trên config từ notebook) ---
+class C:
+    SR = 16000
+    N_FFT = 2048
+    HOP_LENGTH = 512
+    N_MELS = 128 
+    CHUNK_DURATION_S = 3.0
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    IMG_SIZE_MODEL_INPUT = 224 
+    
+    CNN_SMALL_CONV_CHANNELS = [32, 64, 128]
+    CNN_SMALL_POOL_AFTER_CONV = [True, True, True]
+    CNN_SMALL_FC_UNITS = 192 
+    CNN_SMALL_DROPOUT = 0.3 
+
+    CNN_LARGE_CONV_CHANNELS = [64, 128, 256, 512, 512]
+    CNN_LARGE_POOL_AFTER_CONV = [True, True, True, True, False]
+    CNN_LARGE_FC_UNITS = 192 
+    CNN_LARGE_DROPOUT = 0.3
+
+    VIT_SMALL_PATCH_SIZE = 16
+    VIT_SMALL_IN_CHANNELS = 1 
+    VIT_SMALL_DIM = 128      
+    VIT_SMALL_DEPTH = 4      
+    VIT_SMALL_HEADS = 4      
+    VIT_SMALL_MLP_DIM = 256  
+    VIT_SMALL_DROPOUT = 0.1  
+
+    VIT_LARGE_PATCH_SIZE = 16
+    VIT_LARGE_IN_CHANNELS = 1
+    VIT_LARGE_DIM = 384
+    VIT_LARGE_DEPTH = 6
+    VIT_LARGE_HEADS = 8
+    VIT_LARGE_MLP_DIM = 768
+    VIT_LARGE_DROPOUT = 0.1
+    
+    NORM_EPSILON: float = 1e-6
+
+logger.info(f"Sử dụng thiết bị: {C.DEVICE}")
+logger.info(f"Cấu hình Audio: SR={C.SR}, N_FFT={C.N_FFT}, HOP_LENGTH={C.HOP_LENGTH}, N_MELS(gốc)={C.N_MELS}")
+logger.info(f"Chunk duration: {C.CHUNK_DURATION_S}s. Model input size: {C.IMG_SIZE_MODEL_INPUT}x{C.IMG_SIZE_MODEL_INPUT}")
+
+_mel_temp_transform = T.MelSpectrogram(
+    sample_rate=C.SR, n_fft=C.N_FFT, hop_length=C.HOP_LENGTH, n_mels=C.N_MELS, center=True
+).to(C.DEVICE)
+_dummy_waveform_3s = torch.randn(1, int(C.CHUNK_DURATION_S * C.SR), device=C.DEVICE)
+_dummy_mel_spec = _mel_temp_transform(_dummy_waveform_3s)
+ACTUAL_TARGET_SPEC_WIDTH = _dummy_mel_spec.shape[-1]
+del _mel_temp_transform, _dummy_waveform_3s, _dummy_mel_spec
+logger.info(f"Chiều rộng spectrogram gốc cho chunk {C.CHUNK_DURATION_S}s (N_MELS={C.N_MELS}): {ACTUAL_TARGET_SPEC_WIDTH} frames")
+
+MODEL_BASE_DIR = Path("./results")
+MODEL_BASE_DIR.mkdir(exist_ok=True)
+
+MODEL_CONFIGS: Dict[str, Dict[str, Any]] = {
+    "cnn_small": {
+        "name": "CNN Small (Notebook, 3s)", "type": "CNN_Audio",
+        "local_path": MODEL_BASE_DIR / "CNN" / "best_model_CNN_Small_cnn_3s_dataset_102208.pth",
+        "params": {
+            "img_size": C.IMG_SIZE_MODEL_INPUT, 
+            "in_channels": 1, 
+            "num_classes": 2,
+            "linear_output_units_1st_fc": C.CNN_SMALL_FC_UNITS,
+            "cnn_conv_channels": C.CNN_SMALL_CONV_CHANNELS,
+            "cnn_pool_after_conv": C.CNN_SMALL_POOL_AFTER_CONV,
+            "dropout": C.CNN_SMALL_DROPOUT
+        }
+    },
+    "cnn_large": {
+        "name": "CNN Large (Notebook, 3s)", "type": "CNN_Audio",
+        "local_path": MODEL_BASE_DIR / "CNN" / "best_model_CNN_Large_cnn_3s_dataset_114040.pth",
+        "params": {
+            "img_size": C.IMG_SIZE_MODEL_INPUT, 
+            "in_channels": 1, 
+            "num_classes": 2,
+            "linear_output_units_1st_fc": C.CNN_LARGE_FC_UNITS,
+            "cnn_conv_channels": C.CNN_LARGE_CONV_CHANNELS,
+            "cnn_pool_after_conv": C.CNN_LARGE_POOL_AFTER_CONV,
+            "dropout": C.CNN_LARGE_DROPOUT
+        }
+    },
+    "vit_small": {
+        "name": "ViT Small (Notebook, 3s)", "type": "ViT_Audio",
+        "local_path": MODEL_BASE_DIR / "ViT" / "best_model_ViT_Small_vit_3s_dataset_040441.pth",
+        "params": {
+            "img_size": C.IMG_SIZE_MODEL_INPUT, 
+            "patch_size": C.VIT_SMALL_PATCH_SIZE,
+            "num_classes": 2, 
+            "in_channels": C.VIT_SMALL_IN_CHANNELS, 
+            "dim": C.VIT_SMALL_DIM,
+            "depth": C.VIT_SMALL_DEPTH, 
+            "heads": C.VIT_SMALL_HEADS,
+            "mlp_dim": C.VIT_SMALL_MLP_DIM, 
+            "dropout": C.VIT_SMALL_DROPOUT
+        }
+    },
+    "vit_large": {
+        "name": "ViT Large (Notebook, 3s)", "type": "ViT_Audio",
+        "local_path": MODEL_BASE_DIR / "ViT" / "best_model_ViT_Large_vit_3s_dataset_044740.pth",
+        "params": {
+            "img_size": C.IMG_SIZE_MODEL_INPUT, 
+            "patch_size": C.VIT_LARGE_PATCH_SIZE,
+            "num_classes": 2, 
+            "in_channels": C.VIT_LARGE_IN_CHANNELS, 
+            "dim": C.VIT_LARGE_DIM,
+            "depth": C.VIT_LARGE_DEPTH, 
+            "heads": C.VIT_LARGE_HEADS,
+            "mlp_dim": C.VIT_LARGE_MLP_DIM, 
+            "dropout": C.VIT_LARGE_DROPOUT
+        }
+    }
+}
+
+def create_notebook_model(model_type: str, params: Dict[str, Any]) -> nn.Module:
+    if model_type == "CNN_Audio": model = CNN_Audio(**params)
+    elif model_type == "ViT_Audio": model = ViT_Audio(**params)
+    else: raise ValueError(f"Loại mô hình không hợp lệ: {model_type}.")
+    return model
+
+mel_transformer_deploy = T.MelSpectrogram(
+    sample_rate=C.SR, n_fft=C.N_FFT, hop_length=C.HOP_LENGTH, n_mels=C.N_MELS, center=True
+).to(C.DEVICE)
+db_transformer_deploy = T.AmplitudeToDB(stype='power', top_db=80.0).to(C.DEVICE)
+
+def preprocess_audio_for_prediction(audio_bytes: bytes) -> torch.Tensor:
+    try:
+        waveform, sr = sf.read(io.BytesIO(audio_bytes), dtype='float32', always_2d=True)
+        waveform = torch.from_numpy(waveform.T).to(C.DEVICE)
+        if sr != C.SR: waveform = T.Resample(sr, C.SR, device=C.DEVICE)(waveform)
+        if waveform.shape[0] > 1: waveform = torch.mean(waveform, dim=0, keepdim=True)
+
+        chunk_samples = int(C.CHUNK_DURATION_S * C.SR)
+        num_samples = waveform.shape[1]
+        if num_samples > chunk_samples:
+            start_idx = (num_samples - chunk_samples) // 2
+            waveform_chunked = waveform[:, start_idx : start_idx + chunk_samples]
+        elif num_samples < chunk_samples:
+            waveform_chunked = torch.nn.functional.pad(waveform, (0, chunk_samples - num_samples), mode='constant', value=0.0)
+        else: waveform_chunked = waveform
+        
+        with torch.no_grad():
+            mel_spec_original_dim = mel_transformer_deploy(waveform_chunked) 
+            db_spec_original_dim = db_transformer_deploy(mel_spec_original_dim)
+            
+            if db_spec_original_dim.ndim == 3: 
+                db_spec_with_channel = db_spec_original_dim.unsqueeze(1)
+            else: db_spec_with_channel = db_spec_original_dim
+
+            resized_spec = F.interpolate(
+                db_spec_with_channel,
+                size=(C.IMG_SIZE_MODEL_INPUT, C.IMG_SIZE_MODEL_INPUT),
+                mode="bilinear", align_corners=False,
+            )
+            
+            mean = resized_spec.mean(dim=(-1, -2), keepdim=True)
+            std = resized_spec.std(dim=(-1, -2), keepdim=True) + C.NORM_EPSILON
+            input_tensor = (resized_spec - mean) / std
+            
+            expected_shape = (1, 1, C.IMG_SIZE_MODEL_INPUT, C.IMG_SIZE_MODEL_INPUT)
+            if input_tensor.shape != expected_shape:
+                logger.error(f"Shape input_tensor cuối cùng: {input_tensor.shape}, expected: {expected_shape}")
+                raise ValueError("Lỗi shape tensor tiền xử lý.")
+        return input_tensor
+    except Exception as e:
+        logger.error(f"Lỗi preprocess_audio: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Lỗi xử lý file: {str(e)}")
+
+LOADED_MODELS: Dict[str, Optional[nn.Module]] = {}
+logger.info("Bắt đầu khởi tạo và tải models...")
+for model_key, config_entry in MODEL_CONFIGS.items():
+    local_model_file: Path = config_entry["local_path"]
+    if not local_model_file.exists():
+        logger.warning(f"File model '{local_model_file.resolve()}' không tìm thấy. Bỏ qua '{config_entry['name']}'.")
+        LOADED_MODELS[model_key] = None
+        continue
+    try:
+        logger.info(f"Khởi tạo model '{config_entry['name']}' (type: {config_entry['type']})...")
+        model_instance = create_notebook_model(config_entry["type"], config_entry["params"])
+        logger.info(f"Đang tải trọng số cho '{config_entry['name']}' từ '{local_model_file.resolve()}'...")
+        checkpoint = torch.load(local_model_file, map_location=C.DEVICE, weights_only=False)
+
+        if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+            model_weights = checkpoint["model_state_dict"]
+            logger.info(f"Trích xuất 'model_state_dict' cho '{config_entry['name']}'.")
+        elif isinstance(checkpoint, dict) and "state_dict" in checkpoint: 
+            model_weights = checkpoint["state_dict"]
+            logger.info(f"Trích xuất 'state_dict' cho '{config_entry['name']}'.")
+        else:
+            model_weights = checkpoint
+            logger.info(f"Checkpoint cho '{config_entry['name']}' là state_dict trực tiếp.")
+
+        if isinstance(model_weights, dict) and any(k.startswith('module.') for k in model_weights.keys()):
+            logger.info("Xử lý prefix 'module.' từ DataParallel...")
+            from collections import OrderedDict
+            new_state_dict = OrderedDict()
+            for k, v in model_weights.items():
+                name = k[7:] if k.startswith('module.') else k
+                new_state_dict[name] = v
+            model_weights = new_state_dict
+
+        model_instance.load_state_dict(model_weights)
+        model_instance.to(C.DEVICE).eval()
+        LOADED_MODELS[model_key] = model_instance
+        logger.info(f"-> Model '{config_entry['name']}' đã tải thành công.")
+    except Exception as e:
+        logger.error(f"LỖI khi tải model '{config_entry['name']}': {e}", exc_info=True)
+        LOADED_MODELS[model_key] = None
+
+available_model_keys = [key for key, model in LOADED_MODELS.items() if model is not None]
+if not available_model_keys: logger.critical("Không có model nào được tải thành công!")
+else: logger.info(f"Các model khả dụng: {available_model_keys}")
+
+@app.get("/", response_class=HTMLResponse)
+async def home_page(request: Request):
+    model_options = [{"key": k, "name": v["name"]} for k, v in MODEL_CONFIGS.items() if k in available_model_keys]
+    return templates.TemplateResponse("index.html", {"request": request, "model_options": model_options, "selected_models_keys": []})
+
+@app.post("/predict/", response_class=HTMLResponse)
+async def predict_from_form(request: Request, file: UploadFile = File(...), selected_models: List[str] = Form([])):
+    model_options = [{"key": k, "name": v["name"]} for k, v in MODEL_CONFIGS.items() if k in available_model_keys]
+    if not file.filename:
+        error = "Vui lòng chọn file âm thanh."
+        return templates.TemplateResponse("index.html", {"request": request, "error": error, "model_options": model_options, "selected_models_keys": selected_models}, status_code=400)
+    if not selected_models:
+        error = "Vui lòng chọn ít nhất một model."
+        return templates.TemplateResponse("index.html", {"request": request, "error": error, "filename": file.filename, "model_options": model_options, "selected_models_keys": selected_models}, status_code=400)
+
+    try:
+        audio_data = await file.read()
+        input_tensor = preprocess_audio_for_prediction(audio_data)
+    except HTTPException as e:
+        return templates.TemplateResponse("index.html", {"request": request, "error": e.detail, "model_options": model_options, "filename": file.filename, "selected_models_keys": selected_models}, status_code=e.status_code)
+    except Exception as e:
+        logger.error(f"Lỗi không mong muốn khi xử lý file: {e}", exc_info=True)
+        return templates.TemplateResponse("index.html", {"request": request, "error": f"Lỗi xử lý file: {type(e).__name__}", "model_options": model_options, "filename": file.filename, "selected_models_keys": selected_models}, status_code=500)
+
+    results = []
+    for model_key in selected_models:
+        model_instance = LOADED_MODELS.get(model_key)
+        model_display_name = MODEL_CONFIGS.get(model_key, {}).get("name", model_key)
+        result_data = {"model_key": model_key, "model_name": model_display_name, "error": None}
+        if model_instance is None:
+            result_data["error"] = f"Model '{model_display_name}' không khả dụng."
+        else:
+            try:
+                with torch.no_grad():
+                    output_logits = model_instance(input_tensor)
+                    probabilities = torch.softmax(output_logits, dim=1)
+                    prob_fake = probabilities[0, 1].item()
+                result_data["ket_qua"] = "Giả (Fake)" if prob_fake > 0.5 else "Thật (Real)"
+                result_data["xac_suat_gia"] = prob_fake
+            except Exception as e:
+                logger.error(f"Lỗi dự đoán model '{model_display_name}': {e}", exc_info=True)
+                result_data["error"] = f"Lỗi dự đoán ({type(e).__name__})"
+        results.append(result_data)
+    return templates.TemplateResponse("index.html", {"request": request, "predictions": results, "filename": file.filename, "model_options": model_options, "selected_models_keys": selected_models})
+
+if __name__ == "__main__":
+    import uvicorn
+    html_path = TEMPLATES_DIR / "index.html"
+    if not html_path.exists():
+        html_content = """
+<!DOCTYPE html><html lang="vi"><head><meta charset="UTF-8"><title>Phân Loại Âm Thanh Deepfake</title><link href="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/css/bootstrap.min.css" rel="stylesheet"><style>body{font-family:sans-serif;padding-bottom:70px}.container{max-width:800px}.real{border-left:5px solid green}.fake{border-left:5px solid red}.card-header b{font-size:1.1em}.result-real{color:green;font-weight:bold}.result-fake{color:red;font-weight:bold}.footer{position:fixed;left:0;bottom:0;width:100%;background-color:#f8f9fa;color:#6c757d;text-align:center;padding:10px 0;border-top:1px solid #dee2e6}</style></head><body><div class="container mt-4"><h1 class="text-center mb-4">Phân Loại Âm Thanh Deepfake</h1><p class="text-center text-muted">Sử dụng model custom huấn luyện trên dữ liệu chunked 3 giây.</p>{% if error %}<div class="alert alert-danger">{{ error }}</div>{% endif %}<form action="/predict/" method="post" enctype="multipart/form-data" class="mb-5"><div class="mb-3"><label for="file" class="form-label">Chọn file âm thanh (ví dụ: .wav, .mp3):</label><input type="file" name="file" id="file" class="form-control" required></div>{% if model_options %}<div class="mb-3"><label class="form-label">Chọn Model để dự đoán:</label><div>{% for opt in model_options %}<div class="form-check form-check-inline"><input class="form-check-input" type="checkbox" name="selected_models" value="{{ opt.key }}" id="m_{{ opt.key }}" {% if opt.key in selected_models_keys or not selected_models_keys %}checked{% endif %}><label class="form-check-label" for="m_{{ opt.key }}">{{ opt.name }}</label></div>{% endfor %}</div></div><button type="submit" class="btn btn-primary w-100">Phân Loại</button>{% else %}<div class="alert alert-warning">Không có model nào khả dụng. Vui lòng kiểm tra console server.</div>{% endif %}</form>{% if filename %}<h2 class="mt-4">Kết quả cho file: <span class="fw-normal">{{ filename }}</span></h2>{% endif %}{% if predictions %}<div class="row mt-3">{% for pred in predictions %}<div class="col-md-6 mb-3"><div class="card {% if pred.error %}border-warning{% elif pred.ket_qua == 'Thật (Real)' %}real{% else %}fake{% endif %}"><div class="card-header"><b>Model: {{ pred.model_name }}</b></div><div class="card-body">{% if pred.error %}<p class="text-danger"><strong>Lỗi:</strong> {{ pred.error }}</p>{% else %}<p><strong>Kết quả:</strong> <span class="{% if pred.ket_qua == 'Thật (Real)' %}result-real{% else %}result-fake{% endif %}">{{ pred.ket_qua }}</span></p><p><strong>Xác suất là Giả (Fake):</strong> {{ "%.2f"|format(pred.xac_suat_gia * 100) }}%</p><div class="progress"><div class="progress-bar {% if pred.ket_qua == 'Thật (Real)' %}bg-success{% else %}bg-danger{% endif %}" role="progressbar" style="width: {{ pred.xac_suat_gia * 100 }}%;" aria-valuenow="{{ pred.xac_suat_gia * 100 }}" aria-valuemin="0" aria-valuemax="100">{{ "%.0f"|format(pred.xac_suat_gia * 100) }}%</div>{% if pred.ket_qua == 'Thật (Real)' %}<div class="progress-bar bg-secondary" role="progressbar" style="width: {{ (1-pred.xac_suat_gia) * 100 }}%; opacity:0.3;" aria-valuenow="{{ (1-pred.xac_suat_gia) * 100 }}" aria-valuemin="0" aria-valuemax="100"></div>{% endif %}</div>{% endif %}</div></div></div>{% endfor %}</div>{% endif %}</div><div class="footer"><p class="mb-0">© 2024 Deepfake Audio Detector. Phát triển bởi AI Team.</p></div><script src="https://cdn.jsdelivr.net/npm/bootstrap@5.1.3/dist/js/bootstrap.bundle.min.js"></script></body></html>
+"""
+        with open(html_path, "w", encoding="utf-8") as f: f.write(html_content)
+        logger.info(f"File HTML mẫu '{html_path}' đã được tạo.")
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", 7000))
+    logger.info(f"Chạy uvicorn server tại http://{host}:{port}")
+    uvicorn.run(app, host=host, port=port)
+
+===== .\read_file_for_gpt.py =====
+import os
+
+def save_all_source_code(output_path='output.txt', excluded_dirs=None, excluded_files=None):
+    if excluded_dirs is None:
+        excluded_dirs = {
+        }
+    if excluded_files is None:
+        excluded_files = {
+        }
+
+    file_count = 0
+    with open(output_path, 'w', encoding='utf-8') as outfile:
+        for root, dirs, files in os.walk('.'):
+            # Loại trừ thư mục
+            dirs[:] = [d for d in dirs if d not in excluded_dirs]
+
+            for file in files:
+                if file.endswith('.py') and file not in excluded_files:
+                    filepath = os.path.join(root, file)
+                    try:
+                        with open(filepath, 'r', encoding='utf-8') as f:
+                            code = f.read()
+                        outfile.write(f"\n===== {filepath} =====\n")
+                        outfile.write(code + "\n")
+                        file_count += 1
+                    except Exception as e:
+                        print(f"Lỗi đọc {filepath}: {e}")
+
+        # Ghi phần cây thư mục cuối file
+        outfile.write("\n===== DIRECTORY TREE =====\n")
+        for dirpath, dirnames, filenames in os.walk('.'):
+            # Bỏ qua thư mục bị loại
+            dirnames[:] = [d for d in dirnames if d not in excluded_dirs]
+            level = dirpath.count(os.sep)
+            indent = '    ' * level
+            outfile.write(f"{indent}{os.path.basename(dirpath)}/\n")
+            for file in filenames:
+                if file not in excluded_files:
+                    subindent = '    ' * (level + 1)
+                    outfile.write(f"{subindent}{file}\n")
+
+    print(f"✅ Đã lưu {file_count} file Python và cây thư mục vào '{output_path}'.")
+
+if __name__ == '__main__':
+    save_all_source_code()
+
+===== .\demo_workflow\data_preprocessing.py =====
+import os
+import pandas as pd
+import torchaudio
+import torchaudio.transforms as T
+import torch
+from torch.utils.data import Dataset, DataLoader
+import logging
+from tqdm import tqdm
+import random
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+# --- Cấu hình Data Preprocessing ---
+SAMPLE_RATE = 16000
+N_MELS = 128
 N_FFT = 2048
 HOP_LENGTH = 512
-N_MELS = 128
-MAX_FRAMES_SPEC = 313
-FMIN = 0.0
-FMAX = None # Sẽ được tính là sr/2 nếu None
-NORM_EPSILON = 1e-6
-DEVICE = torch.device("cpu") # Luôn dùng CPU trên Vercel Serverless
-VIT_PATCH_SIZE = 16
-VIT_EMBED_DIM = 192
-VIT_DEPTH = 6
-VIT_NUM_HEADS = 6
-VIT_MLP_RATIO = 4.0
-VIT_DROP_RATE = 0.1
-VIT_ATTN_DROP_RATE = 0.1
-CNN_DROPOUT_RATE = 0.4
-
-# --- ĐƯỜNG DẪN MODEL TỪ GITHUB RELEASES ---
-# !!! QUAN TRỌNG: THAY THẾ CÁC URL SAU BẰNG URL THỰC TẾ TỪ GITHUB RELEASE CỦA BẠN !!!
-MODEL_URL_VIT = "https://github.com/namthse182380/audio_deepfake_detection/releases/download/1.0.0/best_vit_model_pytorch.pth"
-MODEL_URL_CNN = "https://github.com/namthse182380/audio_deepfake_detection/releases/download/1.0.0/best_cnn_model_pytorch.pth"
-# Ví dụ:
-# MODEL_URL_VIT = "https://github.com/namthse182380/audio_deepfake_detection/releases/download/v1.0.0/best_vit_model_pytorch.pth"
-# MODEL_URL_CNN = "https://github.com/namthse182380/audio_deepfake_detection/releases/download/v1.0.0/best_cnn_model_pytorch.pth"
+TARGET_SPEC_WIDTH = 256
+DATASET_ROOT = "dataset"
 
 
-# Đường dẫn cục bộ trong môi trường Lambda (Vercel cho phép ghi vào /tmp)
-LOCAL_MODEL_PATH_VIT = Path("/tmp/best_vit_model_pytorch.pth")
-LOCAL_MODEL_PATH_CNN = Path("/tmp/best_cnn_model_pytorch.pth")
+class AudioDeepfakeDataset(Dataset):
+    def __init__(
+        self,
+        metadata_path,
+        dataset_root,
+        set_type,
+        sample_rate=SAMPLE_RATE,
+        n_mels=N_MELS,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        target_spec_width=TARGET_SPEC_WIDTH,
+        augment=None,
+        label_mapping={"real": 0, "fake": 1},
+    ):
+        self.metadata_df = pd.read_csv(metadata_path)
+        self.dataset_root = dataset_root
+        self.set_type = set_type
+        self.sample_rate = sample_rate
+        self.n_mels = n_mels
+        self.n_fft = n_fft
+        self.hop_length = hop_length
+        self.target_spec_width = target_spec_width
+        self.augment = augment
+        self.label_mapping = label_mapping
 
-# --- Định Nghĩa Mô Hình ViT (giữ nguyên từ code bạn cung cấp) ---
-class PatchEmbed(nn.Module):
-    def __init__(self, img_size=(N_MELS, MAX_FRAMES_SPEC), patch_size=16, in_chans=3, embed_dim=768):
-        super().__init__()
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.grid_size = (img_size[0] // patch_size, img_size[1] // patch_size)
-        self.num_patches = self.grid_size[0] * self.grid_size[1]
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        # Để linh hoạt hơn, có thể bỏ assert này nếu kích thước đầu vào có thể thay đổi nhẹ
-        # Hoặc đảm bảo img_size truyền vào ViT constructor khớp với dữ liệu thực tế
-        if H != self.img_size[0] or W != self.img_size[1]:
-             # Cân nhắc resize hoặc padding ở đây nếu cần thiết, hoặc đảm bảo dữ liệu đầu vào luôn đúng kích thước
-             # print(f"Cảnh báo: Kích thước ảnh đầu vào ({H}*{W}) không khớp với mô hình mong đợi ({self.img_size[0]}*{self.img_size[1]}).")
-             pass # Tạm thời bỏ qua để tránh lỗi cứng, nhưng cần kiểm tra
-        x = self.proj(x)
-        x = x.flatten(2)
-        x = x.transpose(1, 2)
-        return x
-
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-        self.scale = head_dim ** -0.5
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
-        attn = self.attn_drop(attn)
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-class Mlp(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
-        super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
-
-class Block(nn.Module):
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
-        super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
-        self.norm2 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-
-    def forward(self, x):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
-        return x
-
-class VisionTransformer(nn.Module):
-    def __init__(self, img_size=(N_MELS, MAX_FRAMES_SPEC), patch_size=16, in_chans=3, num_classes=1,
-                 embed_dim=192, depth=6, num_heads=6, mlp_ratio=4., qkv_bias=True,
-                 drop_rate=0.1, attn_drop_rate=0.1):
-        super().__init__()
-        self.num_classes = num_classes
-        self.num_features = self.embed_dim = embed_dim
-        # Đảm bảo img_size được truyền đúng vào PatchEmbed
-        self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
-        num_patches = self.patch_embed.num_patches
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
-        self.pos_drop = nn.Dropout(p=drop_rate)
-        self.blocks = nn.ModuleList([
-            Block(dim=embed_dim, num_heads=num_heads, mlp_ratio=mlp_ratio, qkv_bias=qkv_bias,
-                  drop=drop_rate, attn_drop=attn_drop_rate)
-            for _ in range(depth)]) # Sửa i thành _
-        self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes)
-        nn.init.trunc_normal_(self.pos_embed, std=.02)
-        nn.init.trunc_normal_(self.cls_token, std=.02)
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=.02)
-            if m.bias is not None: # Sửa: isinstance(m, nn.Linear) and m.bias is not None
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def forward_features(self, x):
-        B = x.shape[0]
-        x = self.patch_embed(x)
-        cls_tokens = self.cls_token.expand(B, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x = x + self.pos_embed
-        x = self.pos_drop(x) # Sửa lại
-        for blk in self.blocks:
-            x = blk(x)
-        x = self.norm(x)
-        return x[:, 0]
-
-    def forward(self, x):
-        x = self.forward_features(x)
-        x = self.head(x)
-        return x
-
-# --- Định Nghĩa Mô Hình CNN (giữ nguyên từ code bạn cung cấp, có sửa lỗi tính toán flattened_size) ---
-class AudioCNN(nn.Module):
-    def __init__(self, num_classes=1, dropout_rate=0.4):
-        super(AudioCNN, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1)
-        self.bn1 = nn.BatchNorm2d(32)
-        self.pool1 = nn.MaxPool2d(kernel_size=2)
-        self.drop1 = nn.Dropout2d(dropout_rate / 2)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1)
-        self.bn2 = nn.BatchNorm2d(64)
-        self.pool2 = nn.MaxPool2d(kernel_size=2)
-        self.drop2 = nn.Dropout2d(dropout_rate / 2)
-        self.conv3 = nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1)
-        self.bn3 = nn.BatchNorm2d(128)
-        self.pool3 = nn.MaxPool2d(kernel_size=2)
-        self.drop3 = nn.Dropout2d(dropout_rate)
-        self.conv4 = nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1)
-        self.bn4 = nn.BatchNorm2d(256)
-        self.pool4 = nn.MaxPool2d(kernel_size=2)
-        self.drop4 = nn.Dropout2d(dropout_rate)
-
-        # Tính toán kích thước đầu vào cho lớp Linear một cách linh hoạt
-        # Tạo một dummy input để xác định kích thước
-        with torch.no_grad(): # Quan trọng: không tính gradient khi chạy dummy pass
-            # Kích thước dummy input: (batch_size, channels, height, width)
-            dummy_input = torch.zeros(1, 1, N_MELS, MAX_FRAMES_SPEC)
-            dummy_output = self._forward_conv(dummy_input)
-            self.flattened_size = dummy_output.view(dummy_output.size(0), -1).shape[1]
-
-        self.fc1 = nn.Linear(self.flattened_size, 512)
-        self.bn_fc1 = nn.BatchNorm1d(512)
-        self.drop_fc1 = nn.Dropout(dropout_rate)
-        self.fc2 = nn.Linear(512, 128)
-        self.bn_fc2 = nn.BatchNorm1d(128)
-        self.drop_fc2 = nn.Dropout(dropout_rate)
-        self.fc3 = nn.Linear(128, num_classes)
-
-    def _forward_conv(self, x): # Helper function để tính flattened_size và dùng trong forward chính
-        x = nn.functional.relu(self.bn1(self.conv1(x)))
-        x = self.pool1(x)
-        x = self.drop1(x)
-        x = nn.functional.relu(self.bn2(self.conv2(x)))
-        x = self.pool2(x)
-        x = self.drop2(x)
-        x = nn.functional.relu(self.bn3(self.conv3(x)))
-        x = self.pool3(x)
-        x = self.drop3(x)
-        x = nn.functional.relu(self.bn4(self.conv4(x)))
-        x = self.pool4(x)
-        x = self.drop4(x)
-        return x
-
-    def forward(self, x):
-        x = self._forward_conv(x)
-        x = x.view(x.size(0), -1) # Flatten
-        x = nn.functional.relu(self.bn_fc1(self.fc1(x)))
-        x = self.drop_fc1(x)
-        x = nn.functional.relu(self.bn_fc2(self.fc2(x)))
-        x = self.drop_fc2(x)
-        x = self.fc3(x)
-        return x
-
-
-# --- Hàm Tiền Xử Lý Âm Thanh ---
-def audio_to_melspectrogram(audio_data_source, sr=SR, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS, max_frames=MAX_FRAMES_SPEC, fmin=FMIN, fmax=FMAX):
-    try:
-        y = None
-        sr_orig = sr # Mặc định
-
-        if isinstance(audio_data_source, bytes): # Từ UploadFile
-            y, sr_orig = sf.read(io.BytesIO(audio_data_source))
-        elif isinstance(audio_data_source, (str, Path)): # Từ đường dẫn file (cho training)
-            # if not Path(audio_data_source).exists(): # Kiểm tra file tồn tại
-            #     print(f"Cảnh báo: File không tồn tại {audio_data_source}")
-            #     return None
-            y, sr_orig = sf.read(str(audio_data_source)) # sf.read cần string
-        else:
-            raise ValueError("audio_data_source phải là bytes (từ UploadFile) hoặc đường dẫn file (str/Path).")
-
-        if y.ndim > 1: # Chuyển thành mono nếu là stereo
-             y = librosa.to_mono(y.T if y.shape[0] > y.shape[1] else y) # Đảm bảo đúng chiều cho to_mono
-
-        if sr_orig != sr:
-            y = librosa.resample(y, orig_sr=sr_orig, target_sr=sr)
-
-        mel_spectrogram = librosa.feature.melspectrogram(
-            y=y, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels, fmin=fmin, fmax=fmax if fmax is not None else sr/2.0
+        self.mel_spectrogram_transform = T.MelSpectrogram(
+            sample_rate=self.sample_rate,
+            n_fft=self.n_fft,
+            hop_length=self.hop_length,
+            n_mels=self.n_mels,
         )
-        log_mel_spectrogram = librosa.power_to_db(mel_spectrogram, ref=np.max)
+        self.amplitude_to_db_transform = T.AmplitudeToDB(stype="power", top_db=80.0)
 
-        current_frames = log_mel_spectrogram.shape[1]
-        if current_frames < max_frames:
-            pad_value = log_mel_spectrogram.min() # Hoặc có thể dùng 0 hoặc giá trị cụ thể
-            pad_width = max_frames - current_frames
-            padded_log_mel_spectrogram = np.pad(
-                log_mel_spectrogram, ((0, 0), (0, pad_width)), mode='constant', constant_values=pad_value
-            )
-            return padded_log_mel_spectrogram
-        elif current_frames > max_frames:
-            truncated_log_mel_spectrogram = log_mel_spectrogram[:, :max_frames]
-            return truncated_log_mel_spectrogram
-        else:
-            return log_mel_spectrogram
-    except Exception as e:
-        error_detail = f"Lỗi xử lý âm thanh: {str(e)} với input type {type(audio_data_source)}"
-        # print(error_detail) # Ghi log chi tiết hơn ở server
-        # Khi training, trả về None để DataLoader có thể bỏ qua sample lỗi
-        if IS_TRAINING and isinstance(audio_data_source, (str, Path)):
-            return None
-        # Khi inference, raise HTTPException
-        raise HTTPException(status_code=400, detail=error_detail)
+        logging.info(
+            f"Dataset initialized with {len(self.metadata_df)} samples from {metadata_path}"
+        )
+        logging.info(
+            f"Spectrogram config: N_MELS={self.n_mels}, TARGET_SPEC_WIDTH={self.target_spec_width}"
+        )
 
+    def __len__(self):
+        return len(self.metadata_df)
 
-# --- Hàm tải model từ URL về /tmp ---
-def download_file(url, destination: Path):
-    """Tải file từ URL về destination nếu chưa tồn tại hoặc nếu URL là placeholder."""
-    if url.startswith("YOUR_GITHUB_RELEASE_URL_FOR_"):
-        print(f"CẢNH BÁO: URL model '{url}' chưa được cấu hình. Model sẽ không được tải.")
-        if destination.exists(): # Xóa file cũ nếu URL là placeholder để tránh dùng nhầm
-            try:
-                destination.unlink()
-                print(f"Đã xóa file model cũ tại {destination} do URL placeholder.")
-            except OSError as e:
-                print(f"Lỗi khi xóa file model cũ {destination}: {e}")
-        return False # Không tải được
+    def __getitem__(self, idx):
+        row = self.metadata_df.iloc[idx]
+        audio_path_relative = row["path"]
+        label_str = row["label"]
+        fake_level = row.get("fake_level", 0)
 
-    if not destination.exists():
-        print(f"Đang tải {url} về {destination}...")
+        # Chuyển fake_level thành số nguyên
         try:
-            response = requests.get(url, stream=True, timeout=60) # Thêm timeout
-            response.raise_for_status()
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            with open(destination, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            print(f"Tải xong: {destination.name}")
-            return True
-        except requests.exceptions.RequestException as e:
-            print(f"Lỗi khi tải model từ {url}: {e}")
-            # Không raise HTTPException ở đây vì hàm này gọi lúc khởi tạo module
-            return False # Không tải được
-    else:
-        print(f"Model {destination.name} đã tồn tại tại {destination}.")
-        return True # Đã tồn tại
-
-
-# --- Tải Mô Hình ---
-def load_model_from_path(model_class_fn, model_path: Path):
-    try:
-        model = model_class_fn().to(DEVICE)
-        model.load_state_dict(torch.load(model_path, map_location=DEVICE))
-        model.eval()
-        return model
-    except Exception as e:
-        print(f"Lỗi tải mô hình từ {model_path}: {str(e)}")
-        # Không raise HTTPException ở đây
-        return None # Trả về None nếu không tải được
-
-vit_model = None
-cnn_model = None
-
-# --- Chỉ Load Mô Hình Khi Không Huấn Luyện ---
-if not IS_TRAINING:
-    print("Đang ở chế độ inference, tiến hành tải models...")
-    # Tải model ViT
-    if download_file(MODEL_URL_VIT, LOCAL_MODEL_PATH_VIT) and LOCAL_MODEL_PATH_VIT.exists():
-        print(f"Đang khởi tạo và tải trọng số ViT model từ {LOCAL_MODEL_PATH_VIT}...")
-        vit_model = load_model_from_path(
-            lambda: VisionTransformer(
-                img_size=(N_MELS, MAX_FRAMES_SPEC), patch_size=VIT_PATCH_SIZE, in_chans=3, num_classes=1,
-                embed_dim=VIT_EMBED_DIM, depth=VIT_DEPTH, num_heads=VIT_NUM_HEADS, mlp_ratio=VIT_MLP_RATIO,
-                qkv_bias=True, drop_rate=VIT_DROP_RATE, attn_drop_rate=VIT_ATTN_DROP_RATE
-            ),
-            LOCAL_MODEL_PATH_VIT
-        )
-        if vit_model:
-            print("ViT model đã tải thành công.")
-        else:
-            print("Không thể tải ViT model.")
-    else:
-        print(f"Không thể tải hoặc không tìm thấy file ViT model tại {LOCAL_MODEL_PATH_VIT} sau khi cố gắng download.")
-
-    # Tải model CNN
-    if download_file(MODEL_URL_CNN, LOCAL_MODEL_PATH_CNN) and LOCAL_MODEL_PATH_CNN.exists():
-        print(f"Đang khởi tạo và tải trọng số CNN model từ {LOCAL_MODEL_PATH_CNN}...")
-        cnn_model = load_model_from_path(
-            lambda: AudioCNN(num_classes=1, dropout_rate=CNN_DROPOUT_RATE),
-            LOCAL_MODEL_PATH_CNN
-        )
-        if cnn_model:
-            print("CNN model đã tải thành công.")
-        else:
-            print("Không thể tải CNN model.")
-    else:
-        print(f"Không thể tải hoặc không tìm thấy file CNN model tại {LOCAL_MODEL_PATH_CNN} sau khi cố gắng download.")
-
-    if not vit_model and not cnn_model:
-        print("CẢNH BÁO NGHIÊM TRỌNG: Không có model nào được tải thành công!")
-    elif not vit_model:
-        print("CẢNH BÁO: ViT model không được tải. Chỉ CNN model khả dụng (nếu có).")
-    elif not cnn_model:
-        print("CẢNH BÁO: CNN model không được tải. Chỉ ViT model khả dụng (nếu có).")
-
-
-# --- Pydantic Model Cho Response (giữ nguyên) ---
-class PredictionResponse(BaseModel):
-    model: str
-    ket_qua: str
-    xac_suat_gia: float
-
-# --- Trang Chủ (Frontend) (giữ nguyên) ---
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
-
-# --- API Endpoint Cho Form HTML ---
-@app.post("/predict/", response_class=HTMLResponse)
-async def predict_audio_from_form( # Đổi tên để tránh trùng với hàm predict_audio (nếu có)
-    request: Request,
-    file: UploadFile = File(...),
-    model_type: str = Form("both")
-):
-    if not file.filename.endswith((".wav", ".mp3", ".flac")):
-        return templates.TemplateResponse(
-            "index.html",
-            {"request": request, "error": "Vui lòng tải lên file WAV, MP3 hoặc FLAC."}
-        )
-    audio_data = await file.read()
-    try:
-        mel_spec = audio_to_melspectrogram(audio_data)
-        if mel_spec is None:
-             return templates.TemplateResponse(
-                "index.html",
-                {"request": request, "error": "Lỗi xử lý file âm thanh, không thể tạo spectrogram."}
+            fake_level = int(fake_level)
+        except (ValueError, TypeError):
+            logging.warning(
+                f"Invalid fake_level '{fake_level}' for sample {audio_path_relative}. Using default 0."
             )
-    except HTTPException as e:
-        return templates.TemplateResponse(
-            "index.html",
-            {"request": request, "error": str(e.detail)}
-        )
+            fake_level = 0
 
-    mean = np.mean(mel_spec)
-    std = np.std(mel_spec)
-    if std < NORM_EPSILON: # Tránh chia cho 0 nếu std quá nhỏ (ví dụ file im lặng)
-        print("Cảnh báo: Độ lệch chuẩn của mel spectrogram quá nhỏ. Sử dụng NORM_EPSILON.")
-        std = NORM_EPSILON
-    mel_spec_normalized = (mel_spec - mean) / std # Bỏ NORM_EPSILON ở mẫu số nếu đã xử lý ở trên
-
-    results = []
-
-    if model_type in ["vit", "both"]:
-        if vit_model is None:
-            results.append({"model": "ViT", "ket_qua": "Lỗi: Model ViT chưa được tải hoặc tải thất bại.", "xac_suat_gia": -1.0})
+        # Kiểm tra xem audio_path_relative đã chứa set_type chưa
+        set_type_prefix = f"{self.set_type}{os.sep}"
+        if audio_path_relative.startswith(set_type_prefix):
+            full_audio_path = os.path.join(self.dataset_root, audio_path_relative)
         else:
-            try:
-                mel_spec_vit = np.stack([mel_spec_normalized]*3, axis=0) # (3, H, W)
-                mel_spec_tensor = torch.tensor(mel_spec_vit, dtype=torch.float32).unsqueeze(0).to(DEVICE) # (1, 3, H, W)
-                with torch.no_grad():
-                    output = vit_model(mel_spec_tensor)
-                    prob = torch.sigmoid(output).item()
-                    prediction = "Giả" if prob > 0.5 else "Thật"
-                    results.append({
-                        "model": "ViT",
-                        "ket_qua": prediction,
-                        "xac_suat_gia": prob
-                    })
-            except Exception as e:
-                print(f"Lỗi khi dự đoán với ViT model: {e}")
-                results.append({"model": "ViT", "ket_qua": f"Lỗi dự đoán: {str(e)[:100]}...", "xac_suat_gia": -1.0})
+            full_audio_path = os.path.join(
+                self.dataset_root, self.set_type, audio_path_relative
+            )
+
+        if not os.path.exists(full_audio_path):
+            logging.warning(
+                f"File audio không tìm thấy: {full_audio_path}. Bỏ qua sample."
+            )
+            return None
+
+        try:
+            waveform, sr = torchaudio.load(full_audio_path)
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            if sr != self.sample_rate:
+                resampler = T.Resample(orig_freq=sr, new_freq=self.sample_rate)
+                waveform = resampler(waveform)
+
+            mel_spec = self.mel_spectrogram_transform(waveform)
+            if mel_spec.ndim == 3 and mel_spec.shape[0] == 1:
+                mel_spec = mel_spec.squeeze(0)
+            mel_spec = self.amplitude_to_db_transform(mel_spec)
+
+            current_width = mel_spec.shape[1]
+            if current_width < self.target_spec_width:
+                pad_amount = self.target_spec_width - current_width
+                mel_spec = torch.nn.functional.pad(
+                    mel_spec,
+                    (0, pad_amount),
+                    "constant",
+                    -80.0,
+                )
+            elif current_width > self.target_spec_width:
+                if self.augment:
+                    start_idx = random.randint(
+                        0, current_width - self.target_spec_width
+                    )
+                    mel_spec = mel_spec[
+                        :, start_idx : start_idx + self.target_spec_width
+                    ]
+                else:
+                    start_idx = (current_width - self.target_spec_width) // 2
+                    mel_spec = mel_spec[
+                        :, start_idx : start_idx + self.target_spec_width
+                    ]
+
+            mel_spec = mel_spec.unsqueeze(0)
+            if self.augment:
+                mel_spec = self.augment(mel_spec)
+
+            label = torch.tensor(self.label_mapping[label_str], dtype=torch.long)
+            return mel_spec, label, fake_level, row["path"]
+
+        except Exception as e:
+            logging.error(f"Lỗi khi tải hoặc xử lý audio '{full_audio_path}': {e}")
+            return None
 
 
-    if model_type in ["cnn", "both"]:
-        if cnn_model is None:
-            results.append({"model": "CNN", "ket_qua": "Lỗi: Model CNN chưa được tải hoặc tải thất bại.", "xac_suat_gia": -1.0})
-        else:
-            try:
-                mel_spec_cnn = np.expand_dims(mel_spec_normalized, axis=0) # (1, H, W)
-                mel_spec_tensor = torch.tensor(mel_spec_cnn, dtype=torch.float32).unsqueeze(0).to(DEVICE) # (1, 1, H, W)
-                with torch.no_grad():
-                    output = cnn_model(mel_spec_tensor)
-                    prob = torch.sigmoid(output).item()
-                    prediction = "Giả" if prob > 0.5 else "Thật"
-                    results.append({
-                        "model": "CNN",
-                        "ket_qua": prediction,
-                        "xac_suat_gia": prob
-                    })
-            except Exception as e:
-                print(f"Lỗi khi dự đoán với CNN model: {e}")
-                results.append({"model": "CNN", "ket_qua": f"Lỗi dự đoán: {str(e)[:100]}...", "xac_suat_gia": -1.0})
+class SpecAugment(torch.nn.Module):
+    def __init__(
+        self,
+        freq_mask_param=30,
+        time_mask_param=100,
+        num_freq_masks=1,
+        num_time_masks=1,
+    ):
+        super().__init__()
+        self.freq_mask = T.FrequencyMasking(freq_mask_param=freq_mask_param)
+        self.time_mask = T.TimeMasking(time_mask_param=time_mask_param)
+        self.num_freq_masks = num_freq_masks
+        self.num_time_masks = num_time_masks
 
-    return templates.TemplateResponse(
-        "index.html",
-        {
-            "request": request,
-            "predictions": results,
-            "filename": file.filename,
-            "selected_model_type": model_type # Để giữ lại lựa chọn model trên form
-        }
+    def forward(self, spec):
+        for _ in range(self.num_freq_masks):
+            spec = self.freq_mask(spec)
+        for _ in range(self.num_time_masks):
+            spec = self.time_mask(spec)
+        return spec
+
+
+def collate_fn(batch):
+    batch = [item for item in batch if item[0] is not None]
+    if not batch:
+        logging.warning("Batch rỗng sau khi lọc sample lỗi.")
+        return None, None, None, None
+
+    specs, labels, fake_levels, paths = zip(*batch)
+    specs = torch.stack(specs)
+    labels = torch.stack(labels)
+    return specs, labels, torch.tensor(list(fake_levels), dtype=torch.long), list(paths)
+
+
+def get_dataloader(
+    set_type, batch_size, shuffle, num_workers=4, include_fake_levels=None
+):
+    metadata_path = os.path.join(
+        DATASET_ROOT, set_type, f"combined_metadata_{set_type}.csv"
     )
 
-# --- API Endpoint Cho Client ---
-@app.post("/api/predict/", response_model=list[PredictionResponse])
-async def api_predict(file: UploadFile = File(...), model_type: str = Query("both", enum=["vit", "cnn", "both"])): # Thêm Query và enum
-    if not file.filename.endswith((".wav", ".mp3", ".flac")):
-        raise HTTPException(status_code=400, detail="Vui lòng tải lên file WAV, MP3 hoặc FLAC.")
-    audio_data = await file.read()
-    try:
-        mel_spec = audio_to_melspectrogram(audio_data)
-        if mel_spec is None:
-            raise HTTPException(status_code=500, detail="Lỗi xử lý file âm thanh, không thể tạo spectrogram.")
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Lỗi không xác định khi xử lý âm thanh: {str(e)}")
+    if not os.path.exists(metadata_path):
+        logging.error(
+            f"File metadata không tìm thấy: {metadata_path}. Vui lòng chạy combine_metadata.py trước."
+        )
+        return None
 
-    mean = np.mean(mel_spec)
-    std = np.std(mel_spec)
-    if std < NORM_EPSILON:
-        std = NORM_EPSILON
-    mel_spec_normalized = (mel_spec - mean) / std
-    results = []
+    dataset = AudioDeepfakeDataset(
+        metadata_path=metadata_path,
+        dataset_root=DATASET_ROOT,
+        set_type=set_type,
+        sample_rate=SAMPLE_RATE,
+        n_mels=N_MELS,
+        n_fft=N_FFT,
+        hop_length=HOP_LENGTH,
+        target_spec_width=TARGET_SPEC_WIDTH,
+        augment=SpecAugment() if set_type == "train" else None,
+    )
 
-    if model_type in ["vit", "both"]:
-        if vit_model is None:
-            raise HTTPException(status_code=503, detail="Model ViT hiện không khả dụng hoặc tải thất bại.")
-        try:
-            mel_spec_vit = np.stack([mel_spec_normalized]*3, axis=0)
-            mel_spec_tensor = torch.tensor(mel_spec_vit, dtype=torch.float32).unsqueeze(0).to(DEVICE)
-            with torch.no_grad():
-                output = vit_model(mel_spec_tensor)
-                prob = torch.sigmoid(output).item()
-                prediction = "Giả" if prob > 0.5 else "Thật"
-                results.append({"model": "ViT", "ket_qua": prediction, "xac_suat_gia": prob})
-        except Exception as e:
-            print(f"Lỗi API khi dự đoán với ViT model: {e}")
-            # Trả về lỗi cụ thể hơn hoặc một PredictionResponse với thông báo lỗi
-            # Ví dụ: results.append({"model": "ViT", "ket_qua": f"Lỗi dự đoán ViT", "xac_suat_gia": -1.0})
-            # Hoặc raise HTTPException nếu muốn dừng hẳn
-            raise HTTPException(status_code=500, detail=f"Lỗi khi dự đoán với ViT: {str(e)[:100]}...")
+    if include_fake_levels is not None:
+        if not isinstance(include_fake_levels, list):
+            include_fake_levels = [include_fake_levels]
+        dataset.metadata_df["fake_level"] = dataset.metadata_df["fake_level"].astype(
+            str
+        )
+        include_fake_levels_str = [str(level) for level in include_fake_levels]
+        initial_len = len(dataset.metadata_df)
+        dataset.metadata_df = dataset.metadata_df[
+            dataset.metadata_df["fake_level"].isin(include_fake_levels_str)
+        ].reset_index(drop=True)
+        logging.info(
+            f"Đã lọc dataset '{set_type}' để chỉ bao gồm fake_level: {include_fake_levels_str}. "
+            f"Từ {initial_len} mẫu giảm xuống còn {len(dataset.metadata_df)} mẫu."
+        )
+        if len(dataset.metadata_df) == 0:
+            logging.warning(
+                f"Không có mẫu nào trong dataset '{set_type}' sau khi lọc theo fake_level: {include_fake_levels_str}."
+            )
+            return None
+
+    initial_len = len(dataset.metadata_df)
+    dataset.metadata_df = dataset.metadata_df.dropna(subset=["path"]).reset_index(
+        drop=True
+    )
+    if len(dataset.metadata_df) < initial_len:
+        logging.warning(
+            f"Đã loại bỏ {initial_len - len(dataset.metadata_df)} mẫu có đường dẫn audio bị thiếu/NaN trong tập '{set_type}'."
+        )
+
+    if len(dataset.metadata_df) == 0:
+        logging.warning(f"Dataset '{set_type}' rỗng sau khi lọc bỏ các mẫu lỗi.")
+        return None
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True,
+    )
+    return loader
 
 
-    if model_type in ["cnn", "both"]:
-        if cnn_model is None:
-            raise HTTPException(status_code=503, detail="Model CNN hiện không khả dụng hoặc tải thất bại.")
-        try:
-            mel_spec_cnn = np.expand_dims(mel_spec_normalized, axis=0)
-            mel_spec_tensor = torch.tensor(mel_spec_cnn, dtype=torch.float32).unsqueeze(0).to(DEVICE)
-            with torch.no_grad():
-                output = cnn_model(mel_spec_tensor)
-                prob = torch.sigmoid(output).item()
-                prediction = "Giả" if prob > 0.5 else "Thật"
-                results.append({"model": "CNN", "ket_qua": prediction, "xac_suat_gia": prob})
-        except Exception as e:
-            print(f"Lỗi API khi dự đoán với CNN model: {e}")
-            raise HTTPException(status_code=500, detail=f"Lỗi khi dự đoán với CNN: {str(e)[:100]}...")
-
-    if not results and model_type != "none": # Trường hợp model_type hợp lệ nhưng không có model nào chạy
-        raise HTTPException(status_code=503, detail=f"Không có model nào được chọn ({model_type}) hoặc các model đã chọn không khả dụng.")
-
-    return results
-
-# --- Phần Huấn Luyện (Chỉ Chạy Nếu IS_TRAINING = True) ---
-if IS_TRAINING:
-    # ... (Giữ nguyên code training của bạn, chỉ đảm bảo nó chạy độc lập khi IS_TRAINING=True)
-    # ... Sau khi training, bạn sẽ upload thủ công các file .pth lên GitHub Releases.
-    import random
-    import glob
-    import time
-    import torch.optim as optim
-    from torch.utils.data import Dataset, DataLoader
-    from sklearn.model_selection import train_test_split
-    from fastapi import Query # Thêm import này nếu dùng Query trong API endpoint
-
-    # --- Định Nghĩa Dataset và Training Loop ---
-    class AudioDataset(Dataset):
-        def __init__(self, filepaths, labels, transform_spectrogram_fn, augment=False, is_vit_input=False):
-            self.filepaths = filepaths
-            self.labels = labels
-            self.transform_spectrogram_fn = transform_spectrogram_fn # audio_to_melspectrogram
-            self.augment = augment
-            self.is_vit_input = is_vit_input
-
-        def __len__(self):
-            return len(self.filepaths)
-
-        def __getitem__(self, idx):
-            filepath = self.filepaths[idx]
-            label = self.labels[idx]
-
-            mel_spec = self.transform_spectrogram_fn(filepath) # Truyền filepath
-            if mel_spec is None:
-                # print(f"Cảnh báo (Dataset): Không thể xử lý file {filepath}, bỏ qua.")
-                return None
-
-            # Augmentation (nếu có) có thể được thêm ở đây
-
-            mean = np.mean(mel_spec)
-            std = np.std(mel_spec)
-            if std < NORM_EPSILON:
-                std = NORM_EPSILON
-            mel_spec_normalized = (mel_spec - mean) / std
-
-            if self.is_vit_input:
-                mel_spec_final = np.stack([mel_spec_normalized]*3, axis=0)
-            else:
-                mel_spec_final = np.expand_dims(mel_spec_normalized, axis=0)
-
-            mel_spec_tensor = torch.tensor(mel_spec_final, dtype=torch.float32)
-            label_tensor = torch.tensor(label, dtype=torch.float32)
-            return mel_spec_tensor, label_tensor
-
-    def collate_fn_skip_none(batch): # Một collate_fn chung
-        batch = list(filter(lambda x: x is not None, batch))
-        if not batch:
-            # Cần trả về tensor rỗng với đúng số chiều để tránh lỗi DataLoader
-            # Giả sử output là (batch, channels, height, width) và (batch)
-            # Điều này khó làm chung chung, nên có collate_fn riêng cho ViT và CNN nếu cần
-            # Hoặc đảm bảo dataset không bao giờ trả về batch rỗng hoàn toàn
-            # print("Cảnh báo: Batch rỗng sau khi lọc None.")
-            # Trả về một tuple tensor rỗng nếu batch hoàn toàn rỗng
-            # Kích thước cụ thể (ví dụ: 0,3,N_MELS,MAX_FRAMES_SPEC) phụ thuộc vào model
-            # Tạm thời trả về tensor 1D rỗng, có thể gây lỗi nếu model mong đợi nhiều chiều hơn
-            return torch.empty(0), torch.empty(0)
-        return torch.utils.data.dataloader.default_collate(batch)
-
-    # --- Hàm Huấn Luyện (Rút Gọn) ---
-    def train_one_epoch(model, train_loader, criterion, optimizer, device, epoch_num, num_epochs, model_name="Model"):
-        model.train()
-        running_loss = 0.0
-        correct_predictions = 0
-        total_samples = 0
-        
-        for i, batch_data in enumerate(train_loader):
-            if not batch_data or len(batch_data) < 2 or batch_data[0].nelement() == 0:
-                # print(f"Epoch {epoch_num+1} - {model_name}: Batch {i} rỗng hoặc không hợp lệ, bỏ qua.")
+if __name__ == "__main__":
+    print("\n--- Testing Data Loaders ---")
+    train_loader = get_dataloader(
+        "train", batch_size=4, shuffle=True, include_fake_levels=[0, 1]
+    )
+    if train_loader:
+        print(f"Số lượng batch trong train_loader: {len(train_loader)}")
+        for i, (specs, labels, fake_levels, paths) in enumerate(train_loader):
+            if specs is None:
+                print("Batch rỗng hoặc lỗi, bỏ qua.")
                 continue
-            inputs, labels = batch_data
-            inputs, labels = inputs.to(device), labels.to(device).unsqueeze(1)
-            
-            optimizer.zero_grad()
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-            
-            running_loss += loss.item() * inputs.size(0)
-            preds = torch.sigmoid(outputs) > 0.5
-            correct_predictions += (preds == labels).sum().item()
-            total_samples += labels.size(0)
-
-        if total_samples == 0:
-            print(f"Cảnh báo: Không có sample nào được xử lý trong epoch {epoch_num+1} cho {model_name}.")
-            return 0.0, 0.0
-
-        epoch_loss = running_loss / total_samples
-        epoch_acc = correct_predictions / total_samples
-        return epoch_loss, epoch_acc
-
-    # --- Cấu Hình Huấn Luyện ---
-    # !!! QUAN TRỌNG: CẬP NHẬT CÁC ĐƯỜNG DẪN NÀY CHO MÔI TRƯỜNG TRAINING CỦA BẠN !!!
-    REAL_AUDIO_PATH_TRAIN = "path/to/your/real/audio_files_for_training"
-    FAKE_AUDIO_PATH_TRAIN = "path/to/your/fake/audio_files_for_training"
-    BATCH_SIZE_TRAIN = 16
-    LEARNING_RATE_TRAIN = 1e-4
-    EPOCHS_TRAIN = 10 # Nên tăng lên cho training thực tế
-    WEIGHT_DECAY_TRAIN = 1e-5
-
-    # Tên file để lưu model sau training (sẽ được upload thủ công lên GitHub Releases)
-    TRAINED_MODEL_FILENAME_VIT = "best_vit_model_pytorch.pth" # Giống tên file sẽ download
-    TRAINED_MODEL_FILENAME_CNN = "best_cnn_model_pytorch.pth" # Giống tên file sẽ download
-
-    def get_audio_files_and_labels(real_dir, fake_dir):
-        real_files = glob.glob(os.path.join(real_dir, '*.wav')) + \
-                     glob.glob(os.path.join(real_dir, '*.mp3')) + \
-                     glob.glob(os.path.join(real_dir, '*.flac'))
-        fake_files = glob.glob(os.path.join(fake_dir, '*.wav')) + \
-                     glob.glob(os.path.join(fake_dir, '*.mp3')) + \
-                     glob.glob(os.path.join(fake_dir, '*.flac'))
-        
-        if not real_files and not fake_files:
-            print(f"CẢNH BÁO (Training): Không tìm thấy file âm thanh nào trong {real_dir} hoặc {fake_dir}")
-            return [], []
-
-        filepaths = real_files + fake_files
-        labels = [0] * len(real_files) + [1] * len(fake_files) # 0 for real, 1 for fake
-        
-        if not filepaths: return [],[] # Tránh lỗi zip nếu rỗng
-        combined = list(zip(filepaths, labels))
-        random.shuffle(combined)
-        filepaths_shuffled, labels_shuffled = zip(*combined)
-        return list(filepaths_shuffled), list(labels_shuffled)
-
-    print("Đang ở chế độ training (IS_TRAINING=True).")
-    if not Path(REAL_AUDIO_PATH_TRAIN).exists() or not Path(REAL_AUDIO_PATH_TRAIN).is_dir() or \
-       not Path(FAKE_AUDIO_PATH_TRAIN).exists() or not Path(FAKE_AUDIO_PATH_TRAIN).is_dir():
-        print(f"Đường dẫn REAL_AUDIO_PATH_TRAIN ('{REAL_AUDIO_PATH_TRAIN}') hoặc "
-              f"FAKE_AUDIO_PATH_TRAIN ('{FAKE_AUDIO_PATH_TRAIN}') không tồn tại hoặc không phải thư mục. "
-              "Bỏ qua phần training.")
+            print(f"Train Batch {i + 1}:")
+            print(f"  Spectrograms shape: {specs.shape}")
+            print(f"  Labels: {labels}")
+            print(f"  Fake Levels: {fake_levels}")
+            print(f"  Paths (first): {paths[0]}")
+            break
     else:
-        filepaths_all, labels_all = get_audio_files_and_labels(REAL_AUDIO_PATH_TRAIN, FAKE_AUDIO_PATH_TRAIN)
-        if not filepaths_all:
-            print("Không có dữ liệu để huấn luyện. Bỏ qua training.")
+        print("Không thể tạo train_loader.")
+
+    print("\n--- Testing Val Loader ---")
+    val_loader = get_dataloader("val", batch_size=4, shuffle=False)
+    if val_loader:
+        print(f"Số lượng batch trong val_loader: {len(val_loader)}")
+        for i, (specs, labels, fake_levels, paths) in enumerate(val_loader):
+            if specs is None:
+                print("Batch rỗng hoặc lỗi, bỏ qua.")
+                continue
+            print(f"Val Batch {i + 1}:")
+            print(f"  Spectrograms shape: {specs.shape}")
+            print(f"  Labels: {labels}")
+            print(f"  Fake Levels: {fake_levels}")
+            print(f"  Paths (first): {paths[0]}")
+            break
+    else:
+        print("Không thể tạo val_loader.")
+
+
+===== .\demo_workflow\main_workflow.py =====
+# scripts/main_workflow.py
+
+import torch
+import torch.nn as nn
+import logging
+import os
+
+# Import các thành phần từ các file đã tạo
+from data_preprocessing import get_dataloader, N_MELS, TARGET_SPEC_WIDTH, DATASET_ROOT
+from models.basic_cnn import BasicCNN
+from models.basic_vit import BasicViT
+
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+
+
+def run_basic_workflow(model_type="cnn", batch_size=4, num_workers=0):
+    """
+    Minh họa workflow từ tải dữ liệu, tiền xử lý đến đưa vào model.
+    """
+    logging.info(f"--- Bắt đầu Workflow cho Model: {model_type.upper()} ---")
+
+    # 1. Tải Dữ liệu
+    # Chúng ta sẽ chỉ lấy một số mẫu của tập train để minh họa
+    # Bao gồm real (0) và fake level 1 (tts_basic)
+    train_loader = get_dataloader(
+        set_type="train",
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        include_fake_levels=[0, 1],
+    )
+
+    if train_loader is None:
+        logging.error(
+            "Không thể tải dữ liệu train. Vui lòng kiểm tra các file metadata và đường dẫn."
+        )
+        return
+
+    logging.info(f"Đã tải thành công {len(train_loader)} batch từ Train Loader.")
+
+    # 2. Khởi tạo Model
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logging.info(f"Sử dụng thiết bị: {device}")
+
+    model = None
+    if model_type == "cnn":
+        model = BasicCNN(
+            num_classes=2,
+            input_channels=1,
+            n_mels=N_MELS,
+            target_spec_width=TARGET_SPEC_WIDTH,
+        )
+    elif model_type == "vit":
+        model = BasicViT(
+            num_classes=2, n_mels=N_MELS, target_spec_width=TARGET_SPEC_WIDTH
+        )
+    else:
+        logging.error(
+            f"Model type '{model_type}' không được hỗ trợ. Vui lòng chọn 'cnn' hoặc 'vit'."
+        )
+        return
+
+    model.to(device)
+    logging.info(f"Đã khởi tạo Model {model_type.upper()} và chuyển sang {device}.")
+    logging.info(f"Cấu trúc Model {model_type.upper()}:\n{model}")
+
+    # 3. Minh họa một vòng lặp huấn luyện đơn giản (chỉ để kiểm tra luồng)
+    # Trong một dự án thực tế, bạn sẽ có vòng lặp huấn luyện đầy đủ với optimizer, loss, backprop, v.v.
+    logging.info("\n--- Minh họa quá trình forward pass với một batch ---")
+
+    # Lấy một batch từ DataLoader
+    # Sử dụng iter() và next() để lấy batch đầu tiên
+    try:
+        specs, labels, fake_levels, paths = next(iter(train_loader))
+    except StopIteration:
+        logging.error(
+            "Train DataLoader rỗng sau khi lọc. Không có dữ liệu để minh họa."
+        )
+        return
+    except Exception as e:
+        logging.error(f"Lỗi khi lấy batch từ DataLoader: {e}")
+        return
+
+    if specs is None:
+        logging.error(
+            "Batch nhận được từ DataLoader là None. Có thể do lỗi trong quá trình tiền xử lý."
+        )
+        return
+
+    logging.info(
+        f"Kích thước Spectrograms trong batch: {specs.shape}"
+    )  # Expected: (batch_size, 1, N_MELS, TARGET_SPEC_WIDTH)
+    logging.info(f"Labels trong batch: {labels}")
+    logging.info(f"Fake Levels trong batch: {fake_levels}")
+
+    # Chuyển dữ liệu lên thiết bị
+    specs = specs.to(device)
+    labels = labels.to(device)
+
+    # Thực hiện forward pass
+    model.eval()  # Chuyển model sang chế độ đánh giá
+    with torch.no_grad():  # Không cần tính gradient trong minh họa này
+        outputs = model(specs)
+
+    logging.info(
+        f"Kích thước Output của Model: {outputs.shape}"
+    )  # Expected: (batch_size, 2)
+    logging.info(f"Outputs (Logits) từ Model (chỉ 2 ví dụ đầu):\n{outputs[:2]}")
+
+    # Để chuyển đổi logits thành xác suất và dự đoán
+    if (
+        model_type == "cnn"
+    ):  # CNN thường dùng sigmoid cho binary class nếu num_classes=1, hoặc softmax nếu num_classes=2 và cross-entropy
+        # Với num_classes=2 và BCEWithLogitsLoss, chúng ta thường chỉ cần một đầu ra (binary classification)
+        # Nhưng ở đây, BasicCNN và BasicViT đều có 2 đầu ra.
+        # Nếu output là 2 logits (ví dụ: cho class 0 và class 1), thì dùng softmax
+        probabilities = torch.softmax(outputs, dim=1)
+        predicted_classes = torch.argmax(probabilities, dim=1)
+    else:  # ViT của Hugging Face thường cho logits sẵn
+        probabilities = torch.softmax(outputs, dim=1)
+        predicted_classes = torch.argmax(probabilities, dim=1)
+
+    logging.info(f"Probabilities từ Model (chỉ 2 ví dụ đầu):\n{probabilities[:2]}")
+    logging.info(
+        f"Predicted Classes từ Model (chỉ 2 ví dụ đầu):\n{predicted_classes[:2]}"
+    )
+
+    logging.info("--- Workflow minh họa hoàn tất ---")
+
+
+if __name__ == "__main__":
+    # Chạy workflow với CNN
+    print("\n\n###########################################")
+    run_basic_workflow(
+        model_type="cnn", batch_size=8
+    )  # Thử batch size lớn hơn nếu GPU cho phép
+    print("###########################################\n\n")
+
+    # Chạy workflow với ViT
+    print("\n\n###########################################")
+    run_basic_workflow(model_type="vit", batch_size=8)
+    print("###########################################\n\n")
+
+
+===== .\demo_workflow\models\basic_cnn.py =====
+# scripts/models/basic_cnn.py
+
+import torch
+import torch.nn as nn
+
+
+class CNN_Audio(nn.Module):
+    def __init__(
+        self, num_classes=2, input_channels=1, n_mels=128, target_spec_width=256
+    ):
+        super(CNN_Audio, self).__init__()
+
+        # Các lớp Convolutional Layers
+        # Input: (Batch, 1, 128, 256)
+        self.conv1 = nn.Conv2d(
+            input_channels, 32, kernel_size=(3, 3), padding=1
+        )  # Output: (Batch, 32, 128, 256)
+        self.bn1 = nn.BatchNorm2d(32)
+        self.relu1 = nn.ReLU()
+        self.pool1 = nn.MaxPool2d(
+            kernel_size=(2, 2), stride=(2, 2)
+        )  # Output: (Batch, 32, 64, 128)
+
+        self.conv2 = nn.Conv2d(
+            32, 64, kernel_size=(3, 3), padding=1
+        )  # Output: (Batch, 64, 64, 128)
+        self.bn2 = nn.BatchNorm2d(64)
+        self.relu2 = nn.ReLU()
+        self.pool2 = nn.MaxPool2d(
+            kernel_size=(2, 2), stride=(2, 2)
+        )  # Output: (Batch, 64, 32, 64)
+
+        self.conv3 = nn.Conv2d(
+            64, 128, kernel_size=(3, 3), padding=1
+        )  # Output: (Batch, 128, 32, 64)
+        self.bn3 = nn.BatchNorm2d(128)
+        self.relu3 = nn.ReLU()
+        self.pool3 = nn.MaxPool2d(
+            kernel_size=(2, 2), stride=(2, 2)
+        )  # Output: (Batch, 128, 16, 32)
+
+        # Tính toán kích thước đầu ra sau các lớp Conv và Pool
+        # Công thức: (InputSize - KernelSize + 2*Padding) / Stride + 1
+        # Hoặc đơn giản hơn, chạy thử một forward pass với dummy input để kiểm tra
+
+        # Kích thước đầu ra sau pool3: (128, 16, 32)
+        # Flattened size: 128 * 16 * 32 = 65536
+
+        # Để làm cho nó linh hoạt hơn với N_MELS và TARGET_SPEC_WIDTH khác nhau,
+        # chúng ta có thể tính toán kích thước đầu ra động.
+        dummy_input = torch.randn(1, input_channels, n_mels, target_spec_width)
+        with torch.no_grad():
+            x = self.pool1(self.relu1(self.bn1(self.conv1(dummy_input))))
+            x = self.pool2(self.relu2(self.bn2(self.conv2(x))))
+            x = self.pool3(self.relu3(self.bn3(self.conv3(x))))
+            self.flattened_features = x.view(x.size(0), -1).shape[
+                1
+            ]  # Lấy kích thước phẳng
+
+        # Lớp Fully Connected (Classifier)
+        self.fc = nn.Linear(self.flattened_features, num_classes)
+
+    def forward(self, x):
+        # x shape: (Batch, 1, N_MELS, TARGET_SPEC_WIDTH)
+
+        x = self.pool1(self.relu1(self.bn1(self.conv1(x))))
+        x = self.pool2(self.relu2(self.bn2(self.conv2(x))))
+        x = self.pool3(self.relu3(self.bn3(self.conv3(x))))
+
+        # Flatten tensor cho lớp FC
+        x = x.view(
+            x.size(0), -1
+        )  # Flatten từ (Batch, Channels, H, W) thành (Batch, Channels*H*W)
+
+        x = self.fc(x)
+        return x
+
+
+# Ví dụ sử dụng và kiểm tra
+if __name__ == "__main__":
+    print("\n--- Testing Basic CNN Model ---")
+    # Đảm bảo N_MELS và TARGET_SPEC_WIDTH khớp với data_preprocessing.py
+    from data_preprocessing import N_MELS, TARGET_SPEC_WIDTH
+
+    model = CNN_Audio(
+        num_classes=2,
+        input_channels=1,
+        n_mels=N_MELS,
+        target_spec_width=TARGET_SPEC_WIDTH,
+    )
+    print(f"Basic CNN model architecture:\n{model}")
+
+    # Tạo một batch input giả lập
+    dummy_input = torch.randn(
+        4, 1, N_MELS, TARGET_SPEC_WIDTH
+    )  # Batch size 4, 1 kênh, 128 mel bands, 256 frames
+
+    output = model(dummy_input)
+    print(f"Input shape: {dummy_input.shape}")
+    print(f"Output shape: {output.shape}")  # Expected: (4, 2)
+    assert output.shape == (4, 2), "Output shape mismatch for BasicCNN"
+    print("Basic CNN test passed!")
+
+
+===== .\demo_workflow\models\basic_vit.py =====
+# scripts/models/basic_vit.py
+
+import torch
+import torch.nn as nn
+from transformers import ViTConfig, ViTForImageClassification
+
+
+class ViT_Audio(nn.Module):
+    def __init__(self, num_classes=2, n_mels=128, target_spec_width=256):
+        super(ViT_Audio, self).__init__()
+
+        # Cấu hình ViT rất cơ bản (Tiny/Small-like)
+        # image_size: kích thước của spectrogram (height, width)
+        # patch_size: kích thước của các "patch" mà ViT chia ảnh ra. Phải chia hết image_size.
+        # hidden_size: kích thước của embedding vector cho mỗi patch.
+        # num_hidden_layers: số lượng lớp Transformer Encoder.
+        # num_attention_heads: số lượng attention heads trong mỗi lớp.
+        # num_channels: số kênh của input image (1 cho spectrogram).
+
+        # Ví dụ cấu hình một ViT-Tiny/Small từ scratch
+        # Đảm bảo patch_size chia hết n_mels và target_spec_width
+        # Nếu n_mels=128, target_spec_width=256:
+        # Patch_size (16,16) -> (128/16, 256/16) = (8, 16) patches
+        self.vit_config = ViTConfig(
+            image_size=(n_mels, target_spec_width),
+            patch_size=(16, 16),  # Hoặc (8, 8), (16, 8) tùy thuộc vào input
+            num_channels=1,  # Spectrograms là grayscale
+            num_labels=num_classes,  # Số lớp đầu ra
+            hidden_size=192,  # Kích thước embedding (ViT-Tiny: 192)
+            num_hidden_layers=6,  # Số lớp Transformer (ViT-Tiny: 12, giảm để đơn giản)
+            num_attention_heads=3,  # Số head attention (ViT-Tiny: 3)
+            intermediate_size=768,  # Kích thước MLP (ViT-Tiny: 768)
+            qkv_bias=True,
+            hidden_dropout_prob=0.1,
+            attention_probs_dropout_prob=0.1,
+            # Các thông số khác có thể giữ mặc định
+        )
+
+        # Khởi tạo ViTForImageClassification từ cấu hình này
+        # Nó sẽ tự động tạo lớp nhúng patch và lớp phân loại cuối cùng
+        self.model = ViTForImageClassification(self.vit_config)
+
+        # Vì chúng ta đã đặt num_labels trong config, lớp classifier cuối cùng đã được cấu hình đúng.
+        # Nếu cần điều chỉnh, có thể truy cập qua self.model.classifier
+        # self.model.classifier = nn.Linear(self.vit_config.hidden_size, num_classes) # Nếu cần thay đổi
+
+    def forward(self, x):
+        # x shape: (Batch, 1, N_MELS, TARGET_SPEC_WIDTH)
+
+        # ViTForImageClassification của Hugging Face mong đợi input là (batch_size, num_channels, height, width)
+        # và sẽ tự động xử lý việc tạo patch embeddings.
+
+        # Output của ViTForImageClassification là một đối tượng (ImageClassifierOutput)
+        # chứa các logits.
+        outputs = self.model(x)
+        logits = outputs.logits  # Lấy phần logits (đầu ra chưa sigmoid/softmax)
+        return logits
+
+
+# Ví dụ sử dụng và kiểm tra
+if __name__ == "__main__":
+    print("\n--- Testing Basic ViT Model ---")
+    from data_preprocessing import N_MELS, TARGET_SPEC_WIDTH
+
+    model = ViT_Audio(num_classes=2, n_mels=N_MELS, target_spec_width=TARGET_SPEC_WIDTH)
+    print(f"Basic ViT model architecture:\n{model}")
+
+    # Tạo một batch input giả lập
+    dummy_input = torch.randn(
+        4, 1, N_MELS, TARGET_SPEC_WIDTH
+    )  # Batch size 4, 1 kênh, 128 mel bands, 256 frames
+
+    output = model(dummy_input)
+    print(f"Input shape: {dummy_input.shape}")
+    print(f"Output shape: {output.shape}")  # Expected: (4, 2)
+    assert output.shape == (4, 2), "Output shape mismatch for ViT_Audio"
+    print("Basic ViT test passed!")
+
+
+===== .\notebooks\cnn_trainer.py =====
+# %% [markdown]
+# ### Imports
+
+# %%
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+# from einops import rearrange # Not needed for CNNs
+# from einops.layers.torch import Rearrange # Not needed for CNNs
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix
+import numpy as np
+import pandas as pd
+import os
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import warnings
+import wandb 
+from dataclasses import dataclass, field  # Import field for default_factory
+
+# Set random seed for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
+# WandB login (assuming you have your API key set up)
+# from kaggle_secrets import UserSecretsClient
+
+# user_secrets = UserSecretsClient()
+# try:
+#     secret_value_0 = user_secrets.get_secret("wandb_api_key")
+#     wandb.login(key=secret_value_0)
+#     print("WandB login successful using wandb_api_key.")
+# except Exception as e:
+#     print(f"Failed to login to WandB: {e}. Please ensure WANDB_API_KEY is set.")
+#     raise
+
+wandb.login(key="5977d6c3b044eb3d92080d4075b5683327a497ac")
+
+# %% [markdown]
+# ### Configurations
+
+# %%
+@dataclass
+class Config:
+    # Data processing parameters
+    SEED: int = 42
+    SR: int = 16000
+    N_FFT: int = 2048
+    HOP_LENGTH: int = 512
+    N_MELS: int = 128
+    FMIN: float = 0.0
+    FMAX: float = 8000.0
+    NUM_TIME_MASKS: int = 2
+    NUM_FREQ_MASKS: int = 2
+    TIME_MASK_MAX_WIDTH: int = 30
+    FREQ_MASK_MAX_WIDTH: int = 15
+    MASK_REPLACEMENT_VALUE: float = -80.0
+    NORM_EPSILON: float = 1e-6
+    LOUDNESS_LUFS: float = -23.0
+    USE_GLOBAL_NORMALIZATION: bool = True
+    USE_RANDOM_CROPPING: bool = True
+    CACHE_DIR_BASE: str = "/kaggle/input/cnn-3s-dataset"
+    DATASET_SUBDIR: str = "cnn_3s_dataset"
+    train_dir: str = "train"
+    val_dir: str = "val"
+    test_dir: str = "test"
+    metadata_file: str = "kaggle_metadata.csv"
+
+    # Model architecture
+    img_size: int = 224
+    num_classes: int = 2
+    in_channels: int = 1
+    dropout: float = 0.1
+
+    # CNN specific architecture parameters
+    cnn_conv_channels: list[int] = field(default_factory=list)
+    cnn_pool_after_conv: list[bool] = field(default_factory=list)
+    linear_output_units_1st_fc: int = 512  # Fixed: Added missing attribute
+
+    # Training parameters
+    learning_rate: float = 1e-4
+    batch_size: int = 32
+    epochs: int = 20
+    weight_decay: float = 1e-4
+    num_workers: int = 4
+
+    # Data augmentation
+    apply_augmentation: bool = True
+    augmentation_prob: float = 0.5
+    audio_length_seconds: float = 3.0
+    overlap_ratio: float = 0.5
+
+    model_size: str = ""
+    dataset_name: str = ""
+
+    def validate(self):
+        assert self.learning_rate > 0, "learning_rate must be positive"
+        assert self.batch_size > 0, "batch_size must be positive"
+        assert self.epochs > 0, "epochs must be positive"
+        assert self.num_workers >= 0, "num_workers must be non-negative"
+        assert len(self.cnn_conv_channels) == len(self.cnn_pool_after_conv), (
+            "cnn_conv_channels and cnn_pool_after_conv must have the same length"
+        )
+
+    def get_full_cache_dir(self):
+        return os.path.join(self.CACHE_DIR_BASE, self.DATASET_SUBDIR)
+
+
+# %%
+BASE_CONFIG = Config()
+
+# Lấy tất cả các tham số từ BASE_CONFIG ngoại trừ các tham số mà chúng ta muốn ghi đè riêng cho từng loại model
+base_params = {
+    f.name: getattr(BASE_CONFIG, f.name)
+    for f in BASE_CONFIG.__dataclass_fields__.values()
+    if f.init and f.name not in ["model_size", "dataset_name", "cnn_conv_channels", 
+                                 "cnn_pool_after_conv", "linear_output_units_1st_fc"]
+}
+
+ALL_MODEL_CONFIGS = {
+    "CNN_Small": Config(
+        **base_params,
+        model_size="CNN_Small",
+        dataset_name="cnn_3s_dataset",
+        cnn_conv_channels=[32, 64, 128],  # Reduced channels
+        cnn_pool_after_conv=[True, True, True],
+        linear_output_units_1st_fc=192,  # Reduced FC units
+    ),
+    # CNN Large: Target 5-7M parameters
+    "CNN_Large": Config(
+        **base_params,
+        model_size="CNN_Large",
+        dataset_name="cnn_3s_dataset",
+        cnn_conv_channels=[64, 128, 256, 512, 512],  # More layers and channels
+        cnn_pool_after_conv=[True, True, True, True, False],
+        linear_output_units_1st_fc=192,  # Larger FC units
+    ),
+}
+
+# %% [markdown]
+# ### Model Definition
+
+# %%
+class CNN_Audio(nn.Module):
+    def __init__(self, img_size: int, in_channels: int, num_classes: int,
+                 linear_output_units_1st_fc: int,
+                 cnn_conv_channels: list[int], cnn_pool_after_conv: list[bool], 
+                 dropout: float = 0.3):
+        super(CNN_Audio, self).__init__()
+        self.in_channels = in_channels
+        self.cnn_conv_channels = cnn_conv_channels
+        self.cnn_pool_after_conv = cnn_pool_after_conv
+        self.img_size = img_size
+        self.dropout = dropout
+        self.num_classes = num_classes
+
+        # Build convolutional layers with proper architecture
+        layers = []
+        in_dim = self.in_channels
+        
+        for i, out_dim in enumerate(self.cnn_conv_channels):
+            # Convolutional block
+            layers.append(nn.Conv2d(in_dim, out_dim, kernel_size=3, padding=1, bias=False))
+            layers.append(nn.BatchNorm2d(out_dim))
+            layers.append(nn.ReLU(inplace=True))
+            
+            # Optional pooling
+            if self.cnn_pool_after_conv[i]:
+                layers.append(nn.MaxPool2d(kernel_size=2, stride=2))
+            
+            # Dropout for regularization
+            layers.append(nn.Dropout2d(self.dropout))
+            in_dim = out_dim
+        
+        self.conv_layers = nn.Sequential(*layers)
+
+        # Calculate flattened size dynamically
+        with torch.no_grad():
+            dummy_input = torch.randn(1, self.in_channels, self.img_size, self.img_size)
+            dummy_output = self.conv_layers(dummy_input)
+            self.flattened_size = dummy_output.view(1, -1).size(1)
+
+        # Adaptive average pooling to reduce feature map size
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))
+        
+        # Calculate size after adaptive pooling
+        with torch.no_grad():
+            dummy_pooled = self.adaptive_pool(dummy_output)
+            self.pooled_size = dummy_pooled.view(1, -1).size(1)
+
+        # Classifier with proper architecture
+        self.classifier = nn.Sequential(
+            nn.Linear(self.pooled_size, linear_output_units_1st_fc),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(linear_output_units_1st_fc, linear_output_units_1st_fc // 2),
+            nn.ReLU(inplace=True),
+            nn.Dropout(dropout),
+            nn.Linear(linear_output_units_1st_fc // 2, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = self.adaptive_pool(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
+
+# %% [markdown]
+# ### Dataset
+
+# %%
+class AudioDataset(Dataset):
+    def __init__(self, cache_dir: str, set_type: str, n_mels: int, config: Config):
+        self.cache_path = os.path.join(cache_dir, getattr(config, f"{set_type}_dir"))
+        self.metadata_path = os.path.join(self.cache_path, config.metadata_file)
+        self.n_mels = n_mels
+        self.training = set_type == "train"
+        self.config = config
+
+        if not os.path.exists(self.metadata_path):
+            raise FileNotFoundError(f"Metadata file not found: {self.metadata_path}")
+        self.metadata = pd.read_csv(self.metadata_path)
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        row = self.metadata.iloc[idx]
+        npy_path = os.path.join(self.cache_path, row["npy_path"])
+        label = int(row["label"])
+
+        try:
+            if not os.path.exists(npy_path):
+                raise FileNotFoundError(f"Spectrogram file not found: {npy_path}")
+            spectrogram = np.load(npy_path)
+            spectrogram = self._preprocess_spectrogram(spectrogram)
+        except Exception as e:
+            print(f"Error loading {npy_path}: {e}")
+            return None
+
+        return spectrogram, torch.tensor(label).long()
+
+    def _preprocess_spectrogram(self, spec):
+        if isinstance(spec, np.ndarray):
+            spec = torch.from_numpy(spec).float()
+
+        if spec.ndim == 2:
+            spec = spec.unsqueeze(0)
+        elif spec.ndim == 4:
+            spec = spec.squeeze(0)
+
+        if spec.shape[-2:] != (self.config.img_size, self.config.img_size):
+            spec = F.interpolate(
+                spec.unsqueeze(0),
+                size=(self.config.img_size, self.config.img_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+
+        if self.config.USE_GLOBAL_NORMALIZATION:
+            mean = spec.mean()
+            std = spec.std() + self.config.NORM_EPSILON
+            spec = (spec - mean) / std
+
+        # Apply augmentation during training
+        if self.training and self.config.apply_augmentation:
+            # Frequency masking
+            for _ in range(self.config.NUM_FREQ_MASKS):
+                freq_mask_width = torch.randint(
+                    0, self.config.FREQ_MASK_MAX_WIDTH, (1,)
+                ).item()
+                freq_start = torch.randint(
+                    0, max(1, spec.shape[-2] - freq_mask_width), (1,)
+                ).item()
+                spec[:, freq_start : freq_start + freq_mask_width, :] = (
+                    self.config.MASK_REPLACEMENT_VALUE
+                )
+            
+            # Time masking
+            for _ in range(self.config.NUM_TIME_MASKS):
+                time_mask_width = torch.randint(
+                    0, self.config.TIME_MASK_MAX_WIDTH, (1,)
+                ).item()
+                time_start = torch.randint(
+                    0, max(1, spec.shape[-1] - time_mask_width), (1,)
+                ).item()
+                spec[:, :, time_start : time_start + time_mask_width] = (
+                    self.config.MASK_REPLACEMENT_VALUE
+                )
+
+        return spec
+
+
+def custom_collate_fn(batch):
+    """Custom collate function to handle None values and invalid shapes"""
+    valid_batch = [item for item in batch if item is not None]
+
+    if not valid_batch:
+        print("Warning: Empty batch after filtering")
+        return torch.empty(0, 1, 224, 224), torch.empty(0, dtype=torch.long)
+
+    data_list, label_list = zip(*valid_batch)
+    expected_shape = (1, 224, 224)
+    valid_data = []
+    valid_labels = []
+
+    for data, label in zip(data_list, label_list):
+        if isinstance(data, torch.Tensor) and data.shape == expected_shape:
+            valid_data.append(data)
+            valid_labels.append(label)
         else:
-            X_train_paths, X_val_paths, y_train, y_val = train_test_split(
-                filepaths_all, labels_all, test_size=0.2, random_state=42,
-                stratify=labels_all if len(set(labels_all)) > 1 and len(labels_all) > 1 else None
+            print(
+                f"Warning: Skipping invalid shape {data.shape if hasattr(data, 'shape') else type(data)} for data with label {label}"
             )
 
-            print(f"Số lượng file training: {len(X_train_paths)}, validation: {len(X_val_paths)}")
+    if not valid_data:
+        print("Warning: No valid data in batch")
+        return torch.empty(0, 1, 224, 224), torch.empty(0, dtype=torch.long)
 
-            # --- DataLoader for ViT ---
-            train_dataset_vit = AudioDataset(X_train_paths, y_train, audio_to_melspectrogram, augment=True, is_vit_input=True)
-            val_dataset_vit = AudioDataset(X_val_paths, y_val, audio_to_melspectrogram, augment=False, is_vit_input=True)
-            train_loader_vit = DataLoader(train_dataset_vit, batch_size=BATCH_SIZE_TRAIN, shuffle=True, collate_fn=collate_fn_skip_none, num_workers=2, pin_memory=True)
-            val_loader_vit = DataLoader(val_dataset_vit, batch_size=BATCH_SIZE_TRAIN, shuffle=False, collate_fn=collate_fn_skip_none, num_workers=2, pin_memory=True)
+    return torch.stack(valid_data, dim=0), torch.stack(valid_labels, dim=0)
 
-            # --- DataLoader for CNN ---
-            train_dataset_cnn = AudioDataset(X_train_paths, y_train, audio_to_melspectrogram, augment=True, is_vit_input=False)
-            val_dataset_cnn = AudioDataset(X_val_paths, y_val, audio_to_melspectrogram, augment=False, is_vit_input=False)
-            train_loader_cnn = DataLoader(train_dataset_cnn, batch_size=BATCH_SIZE_TRAIN, shuffle=True, collate_fn=collate_fn_skip_none, num_workers=2, pin_memory=True)
-            val_loader_cnn = DataLoader(val_dataset_cnn, batch_size=BATCH_SIZE_TRAIN, shuffle=False, collate_fn=collate_fn_skip_none, num_workers=2, pin_memory=True)
+# %% [markdown]
+# ### Training
 
-            # --- Huấn Luyện ViT ---
-            print("Bắt đầu huấn luyện ViT model...")
-            vit_model_train = VisionTransformer(
-                img_size=(N_MELS, MAX_FRAMES_SPEC), patch_size=VIT_PATCH_SIZE, in_chans=3, num_classes=1,
-                embed_dim=VIT_EMBED_DIM, depth=VIT_DEPTH, num_heads=VIT_NUM_HEADS, mlp_ratio=VIT_MLP_RATIO,
-                qkv_bias=True, drop_rate=VIT_DROP_RATE, attn_drop_rate=VIT_ATTN_DROP_RATE
-            ).to(DEVICE)
-            optimizer_vit = optim.AdamW(vit_model_train.parameters(), lr=LEARNING_RATE_TRAIN, weight_decay=WEIGHT_DECAY_TRAIN)
-            criterion_vit = nn.BCEWithLogitsLoss()
-
-            for epoch in range(EPOCHS_TRAIN):
-                train_loss, train_acc = train_one_epoch(vit_model_train, train_loader_vit, criterion_vit, optimizer_vit, DEVICE, epoch, EPOCHS_TRAIN, "ViT")
-                # Thêm validation ở đây nếu cần
-                print(f"Epoch {epoch+1}/{EPOCHS_TRAIN} - ViT - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
-            torch.save(vit_model_train.state_dict(), TRAINED_MODEL_FILENAME_VIT)
-            print(f"Đã lưu ViT model đã huấn luyện vào: {TRAINED_MODEL_FILENAME_VIT}")
+# %%
+def validate_dataset(dataset, name):
+    invalid_count = 0
+    invalid_files = []
+    for idx in range(len(dataset)):
+        row = dataset.metadata.iloc[idx]
+        npy_path = os.path.join(dataset.cache_path, row["npy_path"])
+        if not os.path.exists(npy_path):
+            invalid_count += 1
+            invalid_files.append(npy_path)
+    if invalid_count > 0:
+        print(f"Warning: {invalid_count} invalid samples found in {name} dataset")
+        for f in invalid_files[:5]:
+            print(f" - Missing file: {f}")
+        if len(invalid_files) > 5:
+            print(f" ... and {len(invalid_files) - 5} more")
+    return invalid_count
 
 
-            # --- Huấn Luyện CNN ---
-            print("Bắt đầu huấn luyện CNN model...")
-            cnn_model_train = AudioCNN(num_classes=1, dropout_rate=CNN_DROPOUT_RATE).to(DEVICE)
-            optimizer_cnn = optim.AdamW(cnn_model_train.parameters(), lr=LEARNING_RATE_TRAIN, weight_decay=WEIGHT_DECAY_TRAIN)
-            criterion_cnn = nn.BCEWithLogitsLoss()
+def train_model(
+    model, train_loader, val_loader, optimizer, criterion, device, num_epochs, run_name
+):
+    model.to(device)
+    best_val_f1 = -1
+    patience = 5
+    patience_counter = 0
+    warmup_epochs = 3
 
-            for epoch in range(EPOCHS_TRAIN):
-                train_loss, train_acc = train_one_epoch(cnn_model_train, train_loader_cnn, criterion_cnn, optimizer_cnn, DEVICE, epoch, EPOCHS_TRAIN, "CNN")
-                # Thêm validation ở đây nếu cần
-                print(f"Epoch {epoch+1}/{EPOCHS_TRAIN} - CNN - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
-            torch.save(cnn_model_train.state_dict(), TRAINED_MODEL_FILENAME_CNN)
-            print(f"Đã lưu CNN model đã huấn luyện vào: {TRAINED_MODEL_FILENAME_CNN}")
+    # Đã cập nhật: Đảm bảo T_max được tính toán chính xác
+    # Lịch trình Cosine Annealing cho phần sau của quá trình đào tạo
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-6
+    )
+    # Lịch trình Warmup cho các epoch đầu tiên
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda epoch: (epoch + 1) / warmup_epochs
+        if epoch < warmup_epochs
+        else 1.0,
+    )
 
-            print("Hoàn tất quá trình huấn luyện. Hãy upload các file .pth đã lưu lên GitHub Releases.")
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        batch_count = 0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
+        for batch_idx, batch in enumerate(pbar):
+            if batch is None or len(batch[0]) == 0:
+                print(f"Warning: Skipping empty batch at index {batch_idx}")
+                continue
+
+            data, labels = batch
+            data, labels = data.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(data)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            total_loss += loss.item()
+            batch_count += 1
+
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        if batch_count == 0:
+            print(f"Error: No valid batches in epoch {epoch + 1}")
+            continue
+
+        if epoch < warmup_epochs:
+            warmup_scheduler.step()
+        else:
+            scheduler.step()
+
+        val_loss, val_preds, val_labels, val_probs = evaluate_model(
+            model, val_loader, criterion, device
+        )
+        val_acc = accuracy_score(val_labels, val_preds)
+        val_f1 = f1_score(val_labels, val_preds, average="binary")
+        val_roc_auc = roc_auc_score(val_labels, val_probs[:, 1])
+
+        print(
+            f"Epoch {epoch + 1}: Train Loss: {total_loss / batch_count:.4f}, "
+            f"Val Loss: {val_loss:.4f}, Val F1: {val_f1:.4f}"
+        )
+
+        wandb.log(
+            {
+                "epoch": epoch,
+                "train_loss": total_loss / batch_count,
+                "val_loss": val_loss,
+                "val_f1": val_f1,
+                "val_accuracy": val_acc,
+                "val_roc_auc": val_roc_auc,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+                "warmup_phase": epoch < warmup_epochs,
+            }
+        )
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            patience_counter = 0
+            model_save_path = f"best_model_{run_name}.pth"
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "best_val_f1": best_val_f1,
+                },
+                model_save_path,
+            )
+            print(f"Saved best model with F1: {best_val_f1:.4f}")
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
+
+    return model
 
 
-# --- Chạy Local Server (Chỉ khi không training và file này được chạy trực tiếp) ---
-if __name__ == "__main__" and not IS_TRAINING:
-    import uvicorn
-    print("Chạy uvicorn server cục bộ trên http://0.0.0.0:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
-elif __name__ == "__main__" and IS_TRAINING:
-    print("Đã chạy xong phần training (nếu có dữ liệu). Không khởi động server uvicorn.")
+def evaluate_model(model, loader, criterion, device, return_cm=False):
+    """Enhanced evaluation function"""
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    all_probs = []
+
+    with torch.no_grad():
+        pbar = tqdm(loader, desc="Evaluating", leave=False)
+        for batch in pbar:
+            if batch is None or len(batch[0]) == 0:
+                continue
+            
+            data, labels = batch
+            if -1 in labels.cpu().numpy():
+                continue
+
+            data, labels = data.to(device), labels.to(device)
+            outputs = model(data)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()
+
+            probs = torch.softmax(outputs, dim=1)
+            _, preds = torch.max(outputs, 1)
+
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+    if len(all_labels) < 2:
+        print("Warning: Too few samples for reliable evaluation")
+        return (
+            float("inf"),
+            [],
+            [],
+            np.array([]),
+            np.zeros((2, 2)) if return_cm else None,
+        )
+
+    avg_loss = total_loss / len(loader) if len(loader) > 0 else 0.0
+    
+    if return_cm:
+        cm = confusion_matrix(all_labels, all_preds)
+        return avg_loss, all_preds, all_labels, np.array(all_probs), cm
+    
+    return avg_loss, all_preds, all_labels, np.array(all_probs)
+
+
+def plot_confusion_matrix(cm, run_name, save_dir="results"):
+    """Plot and save confusion matrix"""
+    os.makedirs(save_dir, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=["Real", "Fake"],
+        yticklabels=["Real", "Fake"],
+        ax=ax,
+    )
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(f"Confusion Matrix - {run_name}")
+    cm_plot_path = os.path.join(save_dir, f"cm_{run_name}.png")
+    fig.savefig(cm_plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return cm_plot_path
+
+
+def run_training(training_params):
+    """Main training function"""
+    torch.manual_seed(Config.SEED)
+    np.random.seed(Config.SEED)
+
+    model_size = training_params["model_size"]
+    epochs = training_params["epochs"]
+    learning_rate = training_params["learning_rate"]
+    batch_size = training_params["batch_size"]
+    num_workers = training_params["num_workers"]
+
+    if model_size not in ALL_MODEL_CONFIGS:
+        print(f"Error: Model size '{model_size}' not found in ALL_MODEL_CONFIGS.")
+        return
+
+    config = ALL_MODEL_CONFIGS[model_size]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Initialize improved model
+    model = CNN_Audio(
+        img_size=config.img_size,
+        in_channels=config.in_channels,
+        num_classes=config.num_classes,
+        linear_output_units_1st_fc=config.linear_output_units_1st_fc,
+        cnn_conv_channels=config.cnn_conv_channels,
+        cnn_pool_after_conv=config.cnn_pool_after_conv,
+        dropout=config.dropout,
+    )
+    model = model.to(device)
+
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"Configuring {model_size} model with {param_count:,} parameters...")
+
+    # Sử dụng hàm get_full_cache_dir để tạo đường dẫn dataset
+    model_cache_dir = config.get_full_cache_dir()
+    print(f"Loading data from: {model_cache_dir}")
+
+    # Khởi tạo dataset với 'config' hoàn chỉnh
+    train_dataset = AudioDataset(model_cache_dir, "train", config.N_MELS, config)
+    val_dataset = AudioDataset(model_cache_dir, "val", config.N_MELS, config)
+    test_dataset = AudioDataset(model_cache_dir, "test", config.N_MELS, config)
+
+    for dataset, name in [
+        (train_dataset, "train"),
+        (val_dataset, "val"),
+        (test_dataset, "test"),
+    ]:
+        invalid_count = validate_dataset(dataset, name)
+        if invalid_count == len(dataset):
+            print(f"Error: All samples in {name} dataset are invalid")
+            return
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=custom_collate_fn,
+        pin_memory=True,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=custom_collate_fn,
+        pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=custom_collate_fn,
+        pin_memory=True,
+    )
+
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    print(f"Test samples: {len(test_dataset)}")
+    print(f"Using Batch size: {batch_size}")
+
+    class_counts = np.bincount(
+        [
+            train_dataset[i][1].item()
+            for i in range(len(train_dataset))
+            if train_dataset[i] is not None
+        ]
+    )
+    if 0 in class_counts:
+        print(
+            f"Error: Class {np.argwhere(class_counts == 0).flatten()} has no samples in training dataset"
+        )
+        return
+    class_weights = torch.tensor(
+        [1.0 / max(count, 1e-6) for count in class_counts], dtype=torch.float
+    ).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = optim.Adam(
+        model.parameters(), lr=learning_rate, weight_decay=config.weight_decay
+    )
+
+    run_name = f"{model_size}_{config.dataset_name}_{datetime.now().strftime('%H%M%S')}"
+    wandb.init(project="audio-deepfake-detection", name=run_name, config=training_params) # Logging training_params
+
+    trained_model = train_model(
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        criterion,
+        device,
+        epochs,
+        run_name
+    )
+    
+    print(f"\n--- Evaluating {model_size} on Test Set ({config.dataset_name}) ---")
+    test_loss, test_preds, test_labels, test_probs, test_cm = evaluate_model(
+        trained_model, test_loader, criterion, device, return_cm=True
+    )
+
+    test_acc = accuracy_score(test_labels, test_preds)
+    test_f1 = f1_score(test_labels, test_preds, average="binary")
+    test_roc_auc = roc_auc_score(test_labels, test_probs[:, 1])
+
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test Accuracy: {test_acc:.4f}")
+    print(f"Test F1-score: {test_f1:.4f}")
+    print(f"Test ROC AUC: {test_roc_auc:.4f}")
+
+    cm_plot_path = plot_confusion_matrix(test_cm, run_name=run_name, save_dir="results")
+    wandb.log(
+        {
+            "test_loss": test_loss,
+            "test_accuracy": test_acc,
+            "test_f1_score": test_f1,
+            "test_roc_auc": test_roc_auc,
+            "confusion_matrix": wandb.Image(cm_plot_path),
+        }
+    )
+    
+    wandb.finish()
+    
+    return trained_model
+
+# %% [markdown]
+# ### Define training parameters for CNN models
+
+# %%
+training_params_small = {
+    "model_size": "CNN_Small",
+    "epochs": 20,
+    "learning_rate": 1e-4,
+    "batch_size": 32,
+    "num_workers": 4,
+}
+
+training_params_large = {
+    "model_size": "CNN_Large",
+    "epochs": 20,
+    "learning_rate": 1e-4,
+    "batch_size": 32,
+    "num_workers": 4,
+}
+
+print("=== Training CNN_Small ===")
+trained_model_small = run_training(training_params_small)
+
+print("\n=== Training CNN_Large ===")
+trained_model_large = run_training(training_params_large)
+
+
+# %%
+
+
+
+
+
+===== .\notebooks\vit_trainer.py =====
+# %% [markdown]
+# ### Imports
+
+# %%
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+from einops import rearrange
+from einops.layers.torch import Rearrange
+from sklearn.metrics import accuracy_score, f1_score, roc_auc_score, confusion_matrix
+import numpy as np
+import pandas as pd
+import os
+from tqdm import tqdm
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime
+import warnings
+import wandb
+from dataclasses import dataclass
+
+# Set random seed for reproducibility
+torch.manual_seed(42)
+np.random.seed(42)
+
+# # WandB login
+# from kaggle_secrets import UserSecretsClient
+
+# user_secrets = UserSecretsClient()
+# try:
+#     secret_value_0 = user_secrets.get_secret("wandb_api_key")
+#     wandb.login(key=secret_value_0)
+#     print("WandB login successful using wandb_api_key.")
+# except Exception as e:
+#     print(f"Failed to login to WandB: {e}. Please ensure WANDB_API_KEY is set.")
+#     raise
+wandb.login(key="5977d6c3b044eb3d92080d4075b5683327a497ac")
+
+
+# %% [markdown]
+# ### Configurations
+
+# %%
+@dataclass
+class Config:
+    # Data processing (các tham số này là chung cho dataset, không thay đổi giữa các model)
+    SEED: int = 42
+    SR: int = 16000
+    N_FFT: int = 2048
+    HOP_LENGTH: int = 512
+    N_MELS: int = 128
+    FMIN: float = 0.0
+    FMAX: float = 8000.0
+    NUM_TIME_MASKS: int = 2
+    NUM_FREQ_MASKS: int = 2
+    TIME_MASK_MAX_WIDTH: int = 30
+    FREQ_MASK_MAX_WIDTH: int = 15
+    MASK_REPLACEMENT_VALUE: float = -80.0
+    NORM_EPSILON: float = 1e-6
+    LOUDNESS_LUFS: float = -23.0
+    USE_GLOBAL_NORMALIZATION: bool = True
+    USE_RANDOM_CROPPING: bool = True
+    # CHỖ NÀY LÀ ĐƯỜNG DẪN CHUNG CHO CẢ HAI LOẠI MODEL
+    CACHE_DIR_BASE: str = "/kaggle/input/vit-3s-dataset" # Đường dẫn kaggle
+    # CACHE_DIR_BASE: str = "F:\Deepfake-Audio-Detector\datasets\final_dataset"  # Đường dẫn local
+    DATASET_SUBDIR: str = "vit_3s_dataset" # Thư mục con cụ thể của dataset
+    train_dir: str = "train"
+    val_dir: str = "val"
+    test_dir: str = "test"
+    metadata_file: str = "kaggle_metadata.csv" # Metadata kaggle
+    # metadata_file: str = "metadata.csv"  # Metadata local
+
+    # Model architecture (các tham số này sẽ khác nhau tùy theo model_size)
+    img_size: int = 224
+    patch_size: int = 16
+    num_classes: int = 2
+    in_channels: int = 1
+    dim: int = 128
+    depth: int = 4
+    heads: int = 4
+    mlp_dim: int = 256
+    dropout: float = 0.1
+
+    # Training (có thể là chung hoặc khác nhau tùy theo model)
+    learning_rate: float = 1e-4
+    batch_size: int = 32
+    epochs: int = 20
+    weight_decay: float = 1e-4
+    num_workers: int = 4
+
+    # Data augmentation
+    apply_augmentation: bool = True
+    augmentation_prob: float = 0.5
+    audio_length_seconds: float = 3.0
+    overlap_ratio: float = 0.5
+
+    # Thuộc tính để lưu trữ tên model và dataset cho mục đích cấu hình và logging
+    model_size: str = ""
+    dataset_name: str = "" # Tên logic của dataset, ví dụ "vit_3s_dataset"
+
+    def validate(self):
+        assert self.img_size % self.patch_size == 0, ("img_size must be divisible by patch_size")
+        assert self.dim % self.heads == 0, "dim must be divisible by heads"
+        assert self.learning_rate > 0, "learning_rate must be positive"
+        assert self.batch_size > 0, "batch_size must be positive"
+        assert self.epochs > 0, "epochs must be positive"
+        assert self.num_workers >= 0, "num_workers must be non-negative"
+
+    # Hàm trợ giúp để tạo đường dẫn cache đầy đủ
+    def get_full_cache_dir(self):
+        return os.path.join(self.CACHE_DIR_BASE, self.DATASET_SUBDIR)
+
+# %%
+BASE_CONFIG = Config()
+
+# Lấy tất cả các tham số từ BASE_CONFIG ngoại trừ các tham số kiến trúc và tên model/dataset
+# mà chúng ta muốn ghi đè riêng cho từng loại model
+base_params = {
+    f.name: getattr(BASE_CONFIG, f.name)
+    for f in BASE_CONFIG.__dataclass_fields__.values()
+    if f.init and f.name not in ['dim', 'depth', 'heads', 'mlp_dim', 'model_size', 'dataset_name']
+}
+
+ALL_MODEL_CONFIGS = {
+    "ViT_Small": Config(
+        **base_params, # Giải nén các tham số chung từ BASE_CONFIG
+        # Ghi đè các tham số cụ thể cho ViT_Small
+        dim=128,
+        depth=4,
+        heads=4,
+        mlp_dim=256,
+        model_size="ViT_Small", # Đặt tên model_size
+        dataset_name="vit_3s_dataset", # Đặt tên dataset logic
+    ),
+    "ViT_Large": Config(
+        **base_params, # Giải nén các tham số chung từ BASE_CONFIG
+        # Ghi đè các tham số cụ thể cho ViT_Large
+        dim=384,
+        depth=6,
+        heads=8,
+        mlp_dim=768,
+        model_size="ViT_Large", # Đặt tên model_size
+        dataset_name="vit_3s_dataset", # Đặt tên dataset logic
+    ),
+}
+
+# %% [markdown]
+# ### Model Definition
+
+# %%
+class ViT_Audio(nn.Module):
+    def __init__(self, img_size, patch_size, num_classes, in_channels, dim, depth, heads, mlp_dim, dropout: float = 0.1): # THÊM dropout VÀO ĐÂY
+        super().__init__()
+        assert img_size % patch_size == 0, "Image dimensions must be divisible by the patch size."
+        num_patches = (img_size // patch_size) ** 2
+        patch_dim = in_channels * patch_size * patch_size
+
+        self.patch_size = patch_size
+
+        self.pos_embed = nn.Parameter(torch.randn(1, num_patches + 1, dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, dim))
+
+        self.to_patch_embedding = nn.Sequential(
+            nn.Conv2d(in_channels, patch_dim, kernel_size=patch_size, stride=patch_size),
+            Rearrange('b c h w -> b (h w) c'),
+            nn.LayerNorm(patch_dim),
+            nn.Linear(patch_dim, dim),
+            nn.LayerNorm(dim),
+        )
+
+        transformer_layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=heads,
+            dim_feedforward=mlp_dim,
+            dropout=dropout, # TRUYỀN dropout VÀO ĐÂY
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(transformer_layer, num_layers=depth)
+
+        self.ln = nn.LayerNorm(dim)
+        self.mlp_head = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, num_classes)
+        )
+
+    def forward(self, x):
+        x = self.to_patch_embedding(x)
+        b, n, _ = x.shape
+
+        cls_tokens = self.cls_token.expand(b, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.pos_embed # Positional embedding
+        x = self.transformer(x) # Chú ý rằng PyTorch's TransformerEncoderLayer/Encoder tự xử lý dropout nội bộ
+
+        cls_token_final = x[:, 0]
+        x = self.ln(cls_token_final)
+        return self.mlp_head(x)
+
+# %% [markdown]
+# ### Dataset
+
+# %%
+class AudioDataset(Dataset):
+    # Đã cập nhật: Loại bỏ 'max_frames_spec' khỏi __init__ vì nó sẽ không được sử dụng để cắt/đệm trực tiếp
+    def __init__(self, cache_dir: str, set_type: str, n_mels: int, config: Config):
+        self.cache_path = os.path.join(cache_dir, getattr(config, f"{set_type}_dir"))
+        self.metadata_path = os.path.join(self.cache_path, config.metadata_file)
+        self.n_mels = n_mels
+        # self.target_frames = max_frames_spec # Dòng này không còn được sử dụng để cắt/đệm trước
+        self.training = set_type == "train"
+        self.config = config
+
+        if not os.path.exists(self.metadata_path):
+            raise FileNotFoundError(f"Metadata file not found: {self.metadata_path}")
+        self.metadata = pd.read_csv(self.metadata_path)
+
+    def __len__(self):
+        return len(self.metadata)
+
+    def __getitem__(self, idx):
+        row = self.metadata.iloc[idx]
+        npy_path = os.path.join(self.cache_path, row["npy_path"])
+        label = int(row["label"])
+
+        try:
+            if not os.path.exists(npy_path):
+                raise FileNotFoundError(f"Spectrogram file not found: {npy_path}")
+            spectrogram = np.load(npy_path)
+            spectrogram = self._preprocess_spectrogram(spectrogram)
+        except Exception as e:
+            print(f"Error loading {npy_path}: {e}")
+            return None
+
+        return spectrogram, torch.tensor(label).long()
+
+    def _preprocess_spectrogram(self, spec):
+        if isinstance(spec, np.ndarray):
+            spec = torch.from_numpy(spec).float()
+
+        if spec.ndim == 2:
+            spec = spec.unsqueeze(0)
+        elif spec.ndim == 4:
+            spec = spec.squeeze(0)
+
+        # Đã cập nhật: Loại bỏ logic cắt/đệm dựa trên target_frames (max_frames_spec)
+        # Giờ đây chỉ nội suy trực tiếp đến kích thước img_size x img_size của ViT
+        if spec.shape[-2:] != (self.config.img_size, self.config.img_size):
+            spec = F.interpolate(
+                spec.unsqueeze(0),
+                size=(self.config.img_size, self.config.img_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+
+        if self.config.USE_GLOBAL_NORMALIZATION:
+            mean = spec.mean()
+            std = spec.std() + self.config.NORM_EPSILON
+            spec = (spec - mean) / std
+
+        if self.training and self.config.apply_augmentation:
+            # Augmentation chỉ áp dụng sau khi đã nội suy về kích thước cuối cùng
+            for _ in range(self.config.NUM_FREQ_MASKS):
+                freq_mask_width = torch.randint(
+                    0, self.config.FREQ_MASK_MAX_WIDTH, (1,)
+                ).item()
+                # Đảm bảo tần số mask không vượt quá kích thước img_size (chiều cao)
+                freq_start = torch.randint(
+                    0, max(1, spec.shape[-2] - freq_mask_width), (1,)
+                ).item()
+                spec[:, freq_start : freq_start + freq_mask_width, :] = (
+                    self.config.MASK_REPLACEMENT_VALUE
+                )
+            for _ in range(self.config.NUM_TIME_MASKS):
+                time_mask_width = torch.randint(
+                    0, self.config.TIME_MASK_MAX_WIDTH, (1,)
+                ).item()
+                # Đảm bảo thời gian mask không vượt quá kích thước img_size (chiều rộng)
+                time_start = torch.randint(
+                    0, max(1, spec.shape[-1] - time_mask_width), (1,)
+                ).item()
+                spec[:, :, time_start : time_start + time_mask_width] = (
+                    self.config.MASK_REPLACEMENT_VALUE
+                )
+
+        return spec
+
+
+def custom_collate_fn(batch):
+    valid_batch = [item for item in batch if item is not None]
+
+    if not valid_batch:
+        print("Warning: Empty batch after filtering")
+        return torch.empty(0, 1, 224, 224), torch.empty(0, dtype=torch.long)
+
+    data_list, label_list = zip(*valid_batch)
+    expected_shape = (1, 224, 224)
+    valid_data = []
+    valid_labels = []
+
+    for data, label in zip(data_list, label_list):
+        if isinstance(data, torch.Tensor) and data.shape == expected_shape:
+            valid_data.append(data)
+            valid_labels.append(label)
+        else:
+            print(
+                f"Warning: Skipping invalid shape {data.shape if hasattr(data, 'shape') else type(data)}"
+            )
+
+    if not valid_data:
+        print("Warning: No valid data in batch")
+        return torch.empty(0, 1, 224, 224), torch.empty(0, dtype=torch.long)
+
+    return torch.stack(valid_data, dim=0), torch.stack(valid_labels, dim=0)
+
+
+# %% [markdown]
+# ### Training
+
+# %%
+def validate_dataset(dataset, name):
+    invalid_count = 0
+    invalid_files = []
+    for idx in range(len(dataset)):
+        row = dataset.metadata.iloc[idx]
+        npy_path = os.path.join(dataset.cache_path, row["npy_path"])
+        if not os.path.exists(npy_path):
+            invalid_count += 1
+            invalid_files.append(npy_path)
+    if invalid_count > 0:
+        print(f"Warning: {invalid_count} invalid samples found in {name} dataset")
+        for f in invalid_files[:5]:
+            print(f"  - Missing file: {f}")
+        if len(invalid_files) > 5:
+            print(f"  ... and {len(invalid_files) - 5} more")
+    return invalid_count
+
+
+def train_model(
+    model, train_loader, val_loader, optimizer, criterion, device, num_epochs, run_name
+):
+    model.to(device)
+    best_val_f1 = -1
+    patience = 5
+    patience_counter = 0
+    warmup_epochs = 3
+
+    # Đã cập nhật: Đảm bảo T_max được tính toán chính xác
+    # Lịch trình Cosine Annealing cho phần sau của quá trình đào tạo
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=num_epochs - warmup_epochs, eta_min=1e-6
+    )
+    # Lịch trình Warmup cho các epoch đầu tiên
+    warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(
+        optimizer,
+        lr_lambda=lambda epoch: (epoch + 1) / warmup_epochs
+        if epoch < warmup_epochs
+        else 1.0,
+    )
+
+    for epoch in range(num_epochs):
+        model.train()
+        total_loss = 0
+        batch_count = 0
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{num_epochs}")
+        for batch_idx, batch in enumerate(pbar):
+            if batch is None or len(batch[0]) == 0:
+                print(f"Warning: Skipping empty batch at index {batch_idx}")
+                continue
+
+            data, labels = batch
+            data, labels = data.to(device), labels.to(device)
+
+            optimizer.zero_grad()
+            outputs = model(data)
+            loss = criterion(outputs, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            total_loss += loss.item()
+            batch_count += 1
+
+            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+
+        if batch_count == 0:
+            print(f"Error: No valid batches in epoch {epoch + 1}")
+            continue
+
+        if epoch < warmup_epochs:
+            warmup_scheduler.step()
+        else:
+            scheduler.step()
+
+        val_loss, val_preds, val_labels, val_probs = evaluate_model(
+            model, val_loader, criterion, device
+        )
+        val_acc = accuracy_score(val_labels, val_preds)
+        val_f1 = f1_score(val_labels, val_preds, average="binary")
+        val_roc_auc = roc_auc_score(val_labels, val_probs[:, 1])
+
+        print(
+            f"Epoch {epoch + 1}: Train Loss: {total_loss / batch_count:.4f}, "
+            f"Val Loss: {val_loss:.4f}, Val F1: {val_f1:.4f}"
+        )
+
+        wandb.log(
+            {
+                "epoch": epoch,
+                "train_loss": total_loss / batch_count,
+                "val_loss": val_loss,
+                "val_f1": val_f1,
+                "val_accuracy": val_acc,
+                "val_roc_auc": val_roc_auc,
+                "learning_rate": optimizer.param_groups[0]["lr"],
+                "warmup_phase": epoch < warmup_epochs,
+            }
+        )
+
+        if val_f1 > best_val_f1:
+            best_val_f1 = val_f1
+            patience_counter = 0
+            model_save_path = f"best_model_{run_name}.pth"
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "epoch": epoch,
+                    "best_val_f1": best_val_f1,
+                },
+                model_save_path,
+            )
+            print(f"Saved best model with F1: {best_val_f1:.4f}")
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch + 1}")
+            break
+
+    return model
+
+
+def evaluate_model(model, loader, criterion, device, return_cm=False):
+    model.eval()
+    total_loss = 0
+    all_preds = []
+    all_labels = []
+    all_probs = []
+
+    with torch.no_grad():
+        pbar = tqdm(loader, desc="Evaluating", leave=False)
+        for batch in pbar:
+            if batch is None or len(batch[0]) == 0:
+                continue
+            data, labels = batch
+            if -1 in labels.cpu().numpy():
+                continue
+
+            data, labels = data.to(device), labels.to(device)
+            outputs = model(data)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item()
+
+            probs = torch.softmax(outputs, dim=1)
+            _, preds = torch.max(outputs, 1)
+
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
+
+    if len(all_labels) < 2:
+        print("Warning: Too few samples for reliable evaluation")
+        return (
+            float("inf"),
+            [],
+            [],
+            np.array([]),
+            np.zeros((2, 2)) if return_cm else None,
+        )
+
+    avg_loss = total_loss / len(loader) if len(loader) > 0 else 0.0
+    if return_cm:
+        cm = confusion_matrix(all_labels, all_preds)
+        return avg_loss, all_preds, all_labels, np.array(all_probs), cm
+    return avg_loss, all_preds, all_labels, np.array(all_probs)
+
+
+def plot_confusion_matrix(cm, run_name, save_dir="results"):
+    os.makedirs(save_dir, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(8, 6))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=["Real", "Fake"],
+        yticklabels=["Real", "Fake"],
+        ax=ax,
+    )
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    ax.set_title(f"Confusion Matrix - {run_name}")
+    cm_plot_path = os.path.join(save_dir, f"cm_{run_name}.png")
+    fig.savefig(cm_plot_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    return cm_plot_path
+
+
+def run_training(training_params): # training_params sẽ là dictionary chứa model_size, epochs, v.v.
+    torch.manual_seed(Config.SEED) # Vẫn dùng Config.SEED chung
+    np.random.seed(Config.SEED)
+
+    model_size = training_params["model_size"]
+    epochs = training_params["epochs"]
+    learning_rate = training_params["learning_rate"]
+    batch_size = training_params["batch_size"]
+    num_workers = training_params["num_workers"]
+
+    # Lấy cấu hình đầy đủ cho model_size cụ thể từ ALL_MODEL_CONFIGS
+    if model_size not in ALL_MODEL_CONFIGS:
+        print(f"Error: Model size '{model_size}' not found in ALL_MODEL_CONFIGS.")
+        return
+
+    config = ALL_MODEL_CONFIGS[model_size] # config bây giờ chứa tất cả params cho model đó
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Khởi tạo mô hình dựa trên các tham số từ 'config'
+    model = ViT_Audio(
+        img_size=config.img_size,
+        patch_size=config.patch_size,
+        num_classes=config.num_classes,
+        in_channels=config.in_channels,
+        dim=config.dim, # Lấy dim từ config
+        depth=config.depth, # Lấy depth từ config
+        heads=config.heads, # Lấy heads từ config
+        mlp_dim=config.mlp_dim, # Lấy mlp_dim từ config
+        dropout=config.dropout,
+    )
+    model = model.to(device)
+    # summary(model, input_size=(1, 224, 224)) # Đảm bảo dòng này đã được comment hoặc thay thế
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"Configuring {model_size} model with {param_count:,} parameters...")
+
+    # Sử dụng hàm get_full_cache_dir để tạo đường dẫn dataset
+    model_cache_dir = config.get_full_cache_dir()
+    print(f"Loading data from: {model_cache_dir}")
+
+    # Khởi tạo dataset với 'config' hoàn chỉnh
+    train_dataset = AudioDataset(model_cache_dir, "train", config.N_MELS, config)
+    val_dataset = AudioDataset(model_cache_dir, "val", config.N_MELS, config)
+    test_dataset = AudioDataset(model_cache_dir, "test", config.N_MELS, config)
+
+    for dataset, name in [
+        (train_dataset, "train"),
+        (val_dataset, "val"),
+        (test_dataset, "test"),
+    ]:
+        invalid_count = validate_dataset(dataset, name)
+        if invalid_count == len(dataset):
+            print(f"Error: All samples in {name} dataset are invalid")
+            return
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=custom_collate_fn,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=custom_collate_fn,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        collate_fn=custom_collate_fn,
+    )
+
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    print(f"Test samples: {len(test_dataset)}")
+    print(f"Using Batch size: {batch_size}")
+
+    class_counts = np.bincount(
+        [
+            train_dataset[i][1].item()
+            for i in range(len(train_dataset))
+            if train_dataset[i] is not None
+        ]
+    )
+    if 0 in class_counts:
+        print(
+            f"Error: Class {np.argwhere(class_counts == 0).flatten()} has no samples in training dataset"
+        )
+        return
+    class_weights = torch.tensor(
+        [1.0 / max(count, 1e-6) for count in class_counts], dtype=torch.float
+    ).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = optim.Adam(
+        model.parameters(), lr=learning_rate, weight_decay=config.weight_decay
+    )
+
+    run_name = f"{model_size}_{config.dataset_name}_{datetime.now().strftime('%H%M%S')}"
+    wandb.init(project="audio-deepfake-detection", name=run_name, config=training_params) # Logging training_params
+    
+    trained_model = train_model(
+        model,
+        train_loader,
+        val_loader,
+        optimizer,
+        criterion,
+        device,
+        epochs,
+        run_name,
+    )
+
+    print(f"\n--- Evaluating {model_size} on Test Set ({config.dataset_name}) ---")
+    test_loss, test_preds, test_labels, test_probs, test_cm = evaluate_model(
+        trained_model, test_loader, criterion, device, return_cm=True
+    )
+
+    test_acc = accuracy_score(test_labels, test_preds)
+    test_f1 = f1_score(test_labels, test_preds, average="binary")
+    test_roc_auc = roc_auc_score(test_labels, test_probs[:, 1])
+
+    print(f"Test Loss: {test_loss:.4f}")
+    print(f"Test Accuracy: {test_acc:.4f}")
+    print(f"Test F1-score: {test_f1:.4f}")
+    print(f"Test ROC AUC: {test_roc_auc:.4f}")
+
+    cm_plot_path = plot_confusion_matrix(test_cm, run_name=run_name, save_dir="results")
+    wandb.log(
+        {
+            "test_loss": test_loss,
+            "test_accuracy": test_acc,
+            "test_f1_score": test_f1,
+            "test_roc_auc": test_roc_auc,
+            "confusion_matrix": wandb.Image(cm_plot_path),
+        }
+    )
+    wandb.finish()
+
+    return trained_model
+
+# %% [markdown]
+# ### Define training parameters for ViT models
+
+# %%
+training_params_small = {
+    "model_size": "ViT_Small", 
+    "epochs": 20,
+    "learning_rate": 1e-4,
+    "batch_size": 32,
+    "num_workers": 4,
+}
+
+training_params_large = {
+    "model_size": "ViT_Large", 
+    "epochs": 20,
+    "learning_rate": 1e-4,
+    "batch_size": 32,
+    "num_workers": 4,
+}
+
+
+print("=== Training ViT_Small ===")
+trained_model_small = run_training(training_params_small)
+
+print("\n=== Training ViT_Large ===")
+trained_model_large = run_training(training_params_large)
+
+
+
+
+===== .\utils\modify_metadata_for_kaggle.py =====
+import pandas as pd
+from pathlib import Path
+
+BASE_DIR = Path("F:/Deepfake-Audio-Detector/datasets/final_dataset")
+MODEL_DATASETS = ["cnn_3s_dataset", "vit_3s_dataset"]
+SET_TYPES = ["train", "val", "test"]
+KAGGLE_PREFIX = "/kaggle/input"
+
+
+def transform_path(x, kaggle_dataset, model_dataset, set_type, skipped):
+    try:
+        parts = Path(x).parts
+        if len(parts) >= 2:
+            new_path = Path(
+                KAGGLE_PREFIX,
+                kaggle_dataset,
+                model_dataset,
+                set_type,
+                parts[-2],
+                parts[-1],
+            )
+            return str(new_path).replace("\\", "/")
+        else:
+            skipped.append(x)
+            return x
+    except Exception:
+        skipped.append(x)
+        return x
+
+
+def process_metadata(model_dataset, set_type):
+    kaggle_dataset = model_dataset.replace("_", "-")
+    metadata_path = BASE_DIR / model_dataset / set_type / "metadata.csv"
+
+    if not metadata_path.exists():
+        print(f"❌ File not found: {metadata_path}. Skipping {set_type} set.")
+        return
+
+    try:
+        df = pd.read_csv(metadata_path)
+    except Exception as e:
+        print(f"❌ Error reading {metadata_path}: {e}. Skipping {set_type} set.")
+        return
+
+    if "npy_path" not in df.columns:
+        print(
+            f"❌ Column 'npy_path' not found in {metadata_path}. Skipping {set_type} set."
+        )
+        return
+
+    skipped = []
+    df["npy_path"] = df["npy_path"].apply(
+        lambda x: transform_path(x, kaggle_dataset, model_dataset, set_type, skipped)
+    )
+
+    if skipped:
+        print(
+            f"⚠️  Skipped {len(skipped)} invalid npy_path rows in {model_dataset}/{set_type}."
+        )
+
+    output_metadata_path = BASE_DIR / model_dataset / set_type / "kaggle_metadata.csv"
+
+    try:
+        df.to_csv(output_metadata_path, index=False)
+        print(
+            f"✅ Created kaggle_metadata.csv for {set_type} at: {output_metadata_path}"
+        )
+    except Exception as e:
+        print(f"❌ Error writing file {output_metadata_path}: {e}")
+
+
+if __name__ == "__main__":
+    for model_dataset in MODEL_DATASETS:
+        for set_type in SET_TYPES:
+            process_metadata(model_dataset, set_type)
+
+    print("🎉 Processing completed.")
+
+
+===== .\utils\view_spectrogram.py =====
+import numpy as np
+import matplotlib.pyplot as plt
+import librosa
+import librosa.display
+import os
+import argparse
+
+
+class DataConfig:
+    SEED = 42  # Random seed for reproducibility
+
+    SR = 16000  # Sample rate (Hz)
+    N_FFT = 2048  # FFT window size
+    HOP_LENGTH = 512  # Hop length for spectrogram
+    N_MELS = 128  # Number of Mel bands
+    FMIN = 0.0  # Minimum frequency (Hz)
+    FMAX = 8000.0  # Maximum frequency (Hz)
+
+    MASK_REPLACEMENT_VALUE = -80.0  # Value for masked regions in spectrogram
+    NORM_EPSILON = 1e-6  # Small value to prevent division by zero
+    LOUDNESS_LUFS = -23.0  # Target loudness (LUFS)
+
+
+def view_spectrogram(
+    npy_file_path: str,
+    display_type: str = "mel",
+    save_path: str = "F:\\Deepfake-Audio-Detector\\tests\\view_spectrogram",
+    vmin_display: float = DataConfig.MASK_REPLACEMENT_VALUE,
+):
+    """
+    Tải và hiển thị Mel-spectrogram hoặc spectrogram từ một file .npy.
+
+    Args:
+        npy_file_path (str): Đường dẫn đến file .npy chứa spectrogram.
+        display_type (str): Loại spectrogram để hiển thị ('mel' hoặc 'linear').
+                            Mặc định là 'mel' vì các file .npy được tạo từ Mel-spectrogram.
+        save_path (str, optional): Đường dẫn để lưu hình ảnh spectrogram. Nếu None, sẽ hiển thị.
+    """
+    if not os.path.exists(npy_file_path):
+        print(f"Lỗi: File .npy không tồn tại tại đường dẫn '{npy_file_path}'")
+        return
+
+    try:
+        spectrogram_db = np.load(npy_file_path)
+    except Exception as e:
+        print(f"Lỗi khi tải file .npy '{npy_file_path}': {e}")
+        return
+
+    print(
+        f"Tải thành công spectrogram từ '{npy_file_path}'. Hình dạng: {spectrogram_db.shape}"
+    )
+
+    if spectrogram_db.ndim not in [2, 3]:
+        print("Lỗi: Hình dạng spectrogram không hợp lệ. Mong đợi 2D (n_mels, n_frames) hoặc 3D (1, n_mels, n_frames).")
+        print(f"Hình dạng hiện tại: {spectrogram_db.shape}")
+        return
+
+    # Nếu là 3D (ví dụ: (1, n_mels, n_frames) do unsqueeze(0) trong quá trình lưu), thì loại bỏ chiều đầu tiên
+    if spectrogram_db.ndim == 3 and spectrogram_db.shape[0] == 1:
+        spectrogram_db = spectrogram_db.squeeze(0)
+
+    plt.figure(figsize=(12, 6))
+
+    if display_type == "mel":
+        # Hàm specshow của librosa yêu cầu giá trị tần số Mel là trục Y
+        # Với Mel-spectrogram đã ở dạng dB, chúng ta chỉ cần hiển thị
+        librosa.display.specshow(
+            spectrogram_db,
+            sr=DataConfig.SR,
+            x_axis="time",
+            y_axis="mel",
+            fmin=DataConfig.FMIN,
+            fmax=DataConfig.FMAX,
+            hop_length=DataConfig.HOP_LENGTH,
+            cmap="viridis",
+            vmax=0.0,  # Giá trị dB max, thường là 0 dB (ref=np.max)
+            vmin=vmin_display,  # Giá trị dB min cho màu sắc
+        )
+        plt.colorbar(format="%+2.0f dB")
+        plt.title(f"Mel-Spectrogram from {os.path.basename(npy_file_path)}")
+        plt.ylabel("Mel Frequency")
+    elif display_type == "linear":
+        # Để hiển thị linear spectrogram từ Mel-spectrogram, bạn cần chuyển đổi ngược lại
+        # Tuy nhiên, chuyển đổi ngược từ Mel-spectrogram đã ở dB là không chính xác hoàn toàn.
+        # Thường thì bạn sẽ hiển thị spectrogram (linear scale) hoặc Mel-spectrogram (mel scale).
+        # Nếu muốn hiển thị spectrogram tuyến tính, bạn cần tải file âm thanh gốc và tính toán lại.
+        # Ở đây, chúng ta vẫn hiển thị nó nhưng trên trục tần số tuyến tính
+        print("Cảnh báo: Hiển thị Mel-spectrogram trên trục tần số tuyến tính.")
+        librosa.display.specshow(
+            spectrogram_db,
+            sr=DataConfig.SR,
+            x_axis="time",
+            y_axis="linear",
+            hop_length=DataConfig.HOP_LENGTH,
+            cmap="viridis",
+            vmax=0.0,
+            vmin=vmin_display,
+        )
+        plt.colorbar(format="%+2.0f dB")
+        plt.title(f"Spectrogram (Linear Freq) from {os.path.basename(npy_file_path)}")
+        plt.ylabel("Frequency (Hz)")
+    else:
+        print(
+            f"Loại hiển thị '{display_type}' không được hỗ trợ. Chỉ hỗ trợ 'mel' hoặc 'linear'."
+        )
+        return
+
+    plt.tight_layout()
+
+    if save_path:
+        try:
+            plt.savefig(save_path)
+            print(f"Spectrogram đã được lưu tại '{save_path}'")
+        except Exception as e:
+            print(f"Lỗi khi lưu hình ảnh: {e}")
+        plt.close()  # Đóng plot sau khi lưu để tránh hiển thị nếu không cần
+    else:
+        plt.show()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Hiển thị Mel-spectrogram hoặc spectrogram từ file .npy."
+    )
+    parser.add_argument(
+        "npy_file", type=str, help="Đường dẫn đến file .npy chứa spectrogram."
+    )
+    parser.add_argument(
+        "--type",
+        type=str,
+        default="mel",
+        choices=["mel", "linear"],
+        help="Loại hiển thị spectrogram: 'mel' (mặc định) hoặc 'linear'.",
+    )
+    parser.add_argument(
+        "--save",
+        type=str,
+        default=None,
+        help="Đường dẫn để lưu hình ảnh spectrogram (ví dụ: output.png). Nếu không chỉ định, sẽ hiển thị cửa sổ.",
+    )
+    parser.add_argument(
+        "--vmin",
+        type=float,
+        default=DataConfig.MASK_REPLACEMENT_VALUE,  # Giá trị mặc định mới
+        help="Giá trị dB tối thiểu để hiển thị spectrogram. Giá trị âm. Mặc định là -80.0 dB. Có thể điều chỉnh về -50.0 để hiển thị rõ hơn các chi tiết.",
+    )
+    # hiện ảnh lên màn hình
+    # python view_spectrogram.py <đường_dẫn_đến_file.npy>
+    
+    # lưu ảnh
+    # python view_spectrogram.py <đường_dẫn_đến_file.npy> --save spectrogram_output.png
+    
+    args = parser.parse_args()
+
+    view_spectrogram(args.npy_file, args.type, args.save, args.vmin)
+
 
 ===== DIRECTORY TREE =====
 ./
-    best_cnn_large_model.pth
-    best_cnn_medium_model.pth
-    best_cnn_small_model.pth
-    best_vit_large_model.pth
-    best_vit_medium_model.pth
-    best_vit_small_model.pth
+    .gitignore
+    environment.yml
     main_deploy.py
-    main_local.ipynb
-    requirements.txt
-    vercel.json
+    output.txt
+    README.md
+    read_file_for_gpt.py
+    ws.code-workspace
     .git/
+        .TAG_EDITMSG.swp
         COMMIT_EDITMSG
         config
         description
@@ -793,82 +2661,468 @@ elif __name__ == "__main__" and IS_TRAINING:
                     master
                 remotes/
                     origin/
+                        HEAD
                         master
         objects/
+            01/
+                0752f50b1b1bfd2f1534d15b14153a8899aef2
+            02/
+                4dbc5e6e1d0e59a07e3c952964b9e781e2e4bc
+                9fd31439853f5d090c637764b0ebd009099026
+            04/
+                ae023e5cc15ca9461025366574725af4b07e2b
+            05/
+                83d444fbafd6f4d221f8460f316fe956b94399
+            08/
+                cd215f02676618734ef18211bb28db28d53825
             09/
+                29b987a4ed3208262cb9be8bb88912692d2a70
                 ecd39008a307787a3f6dd6e145330ca3f3b5d7
+            0b/
+                6a07e2229f81d7d3024e315bf5d841a4b88573
+            0c/
+                9a379878f86a6586cdf32382d231ee4345b82a
+            0d/
+                0e10a3c57402d1fd7a26b878f734e6d2784d53
+            0e/
+                ccbac69f4073864cbd475e4f718fc8fb3a8f47
             0f/
                 cbc247c9cc28666fda77058f1ac7fce1f77d2b
             12/
                 090303d9312bfe793a101e62b4c09685bf742a
+            13/
+                21d966c1ac2afe60d6e1abfbf5243ef05c9ecf
+                46742ae207e098d04a9966592a10597c6da53c
             14/
                 63717c09d17b1dde85965129f4653499e1727d
+                96c9cba637fd5884f115a4ad8f95e280eceed6
+            15/
+                594b41867fd21bcfcb62c60c5514bd1a5b8062
+            16/
+                32b64f584581b45c9db6d92e6bee994946bafe
+            17/
+                01b6122826e399c92b18e7e407aae95e302193
+            18/
+                1b5aa62c03449ef8788d39e800252a37817506
+                abb750896dc2085571836d8f42dc0dae156e65
+                fccf6728dc345565db237ea170c72477d46ddb
+            19/
+                1c6ce4bf9ed9938b0d406aa51985658058520e
+            1a/
+                d5ca1172710fd9005990a3b3f784052a18dd7d
             1c/
                 3766a3d25f6c37ae5891be8cf941b5b239ce20
+            1e/
+                47d2c1fb7fedc157c6edfdd5dc3377337aa4f1
+            1f/
+                1d2b04f4330a7a190a71ac9090e3fa16a97b07
+            20/
+                3596a44b0e43f82cd94696e5d6341d07d788d4
+                703524bfc9e5e0a7ce89c8424ca2d4a3bde29e
+                e4afcbd1e5c5e4750a077c536db28590460a79
+            21/
+                2046560ac9a3fb644edcaa18fbb24212414d7a
+                5c31dddeb37f206bcc3c495b9c97e23ec19c8b
+            22/
+                223bddf534a5614e768020a6730fcba121a32f
+            23/
+                3af8271a8c606d36ff6ae49f6d0507fba14b65
+                3ecdba1988a31ba8746d0688a45df21bcfb411
+            24/
+                7c0880dca6e4d73628aeb33db34ed3d3741130
+                b7222dbe1ebf3d687031d68f8e52b8271ec51d
+            26/
+                40579fb12bc9e073ff7189f0ddd868e6f4939f
+            29/
+                a66e0676fab40e0d6509d2f17b354386834983
+                c139e9df802aeb92ad0c7974d2d00838df7b23
+                e6af3a37020b1bd0b21e9c8f267f2c3ec81723
+            2a/
+                20cbd09ba5a73be6890045b9a45d73b3cf4d2d
+                db8d61a6bbf9859cb0b7fbd3b39855fa9603ae
+            2b/
+                12ff5ae08d405f4268298b21294b140850cfb0
+                d722994c390bee1c41bf0667818ed0532a2815
+            2c/
+                006ff9d3765ad361a21bb432a3e5339d46593e
+            2d/
+                4ed0394e329714c0c1577fa03a3cf91addc02d
             2e/
                 7bb35a1a082cae7c2af1a22063ad05479f5ba5
+                7d91ab5007655d1dd35f71213d718a23ee98de
+            30/
+                4b3a6c09acd9cfd302a3f9f8fd0bdf9720f4ac
+                c0e8b9a5231852ad730c3e9e0348ed764af635
+            31/
+                e9f044ed466261e4786a6923351282a7bd568d
+            33/
+                6cf8ffd4b15bd79404219191fa36670adcae88
+                abfff1c11205292a9cb4e5529a2857a98fd53e
+            36/
+                27c09d8528e4c6c507be3d23a5f81282fbdbb2
+                5a34725cea702b8acdf5ff6e675cab0ea9e90c
+                f87f7e9b0a132ff4726389c2308ebaf0f994d6
+                tmp_obj_axnN8s
+            37/
+                b5f2a629ccbc1acbff4817ce1b9159b0c02e9c
+            38/
+                89d31a384dfa766317f60f730f38301e60c0fa
+            39/
+                117acb81454d938fbe746d92013a1c4bfe4048
+            3c/
+                18ad4d981e733634a4fb5565423725f25ae64a
             3e/
+                413f54af7112980d3eec92492e6201a525b013
                 6606ec993f33b623c42d999a577d55b037ba3d
+                7edbd1757779854657c7f76373d03bc8e9e3b1
+                abf7100f8f7d3e1100b88a2bdb9f2859b24633
             40/
                 1d34408ef8446da51929333fda816207a31103
                 7be3695c5afbb078cae89ea1e4372e6d98acee
+                b99a074bb959ac466d65daf9c7b44dba66d5c6
+                d54db9052cd96b869a22020740c4216fe66393
+                d5f7674bcce50ab4f0cb196cb18b1c76bdb4ba
+            42/
+                6406f59bfd81b364f0a271043d0dfb3825e488
+            43/
+                bc1da40bc111e4395cea35342172404187c655
             45/
                 a94d4609ec8ee9e6fb84f5543c86f839871381
                 becfefd60c183e5e2b885b5bb8e2a52f648821
+            46/
+                121f61cd5b3511320c94a3eec2ae5351ae5197
+            48/
+                bb5061f1490aa88282c48a5dfaf14c6d605aa3
+            49/
+                9b938430e2030edde270870ddaa5023bebd735
+            4a/
+                207c2e6c43e0787884ef9d1d3d0504d98576f0
+            4b/
+                b951caa6bd0cb61933b7ff75ef29a7c88232d7
+            4d/
+                adc76e5bf3d4c6ad6b325be02e44f81bc83af7
+            4f/
+                a73a02106737cf62a326d41bfc424c35a8c97f
             50/
+                2be74e1dfced900b3d04dac3f9be7c792258da
+                793f963c88d7c2cb15c7b60a829b392b2e8207
                 ed2181ca550a6692a164baf29dca9c1a497f33
+                f9389e1e0a851ac723339aa94c898cece787fe
+            52/
+                b3458b8ff5c77e1d58c23d82807ae7d8641148
+                c3134f5560c6015444bf155c84f4484feafd06
+                ef81940bcf666072a9a9828cac318c9fab6c78
+            53/
+                a54603f79c6e0c8238055a43d23d62458241d9
+            54/
+                4a2224ca68b17805d2304f101494b5cc4b9cab
+                ea70815f5c3ebbe8f292dc14485665f16a92dc
+                f5b80c417bfc2c212603100f4e005c24bc29ba
+            57/
+                b27ef29bd602c0fe9fc88782f8d71bf5203a49
+                ca4cb68b883ceb03248e0a87967d5c3be104d6
+            59/
+                f262a1aa3b95e9bd8b15ad038601eeaa560cb5
+            5b/
+                116b1d86ce04a64126b8833f8bbca76e7ce536
+                b7e7bc7372e02830fc92eface225e34f880246
             5c/
                 bfa47699c6ad3fb41399e8d38665f8de8f514d
+            5d/
+                58a1c844bf4d8f1478195ed1ac13fd68a43428
+            60/
+                b392d21af7f81987477165f4d1fcf41ffcdb1a
+            61/
+                e2c2ab90bc7dee09ee9f64547d90aed3d469d8
+            62/
+                635d4fe5a5d24b95cbe8ba9b535def9ce083af
+                7dbc6b08e6de4ba8fd2ae171bdc2058d56b19e
+                f910d405b9c5cc7ca28676fd3167b70f22b143
+            63/
+                4856a135151796fc774d7833ade916fa4e9bc9
             64/
                 67b27bc786c0fbd9fc05a75563d76671ca43c1
+                6aee71342e0d9a912e2c7adec1c3ae989fa7cd
+            66/
+                641a18483988898e6cbb69b277021d1de4c562
+                798eaa3feb563208a61f47233362e43b4d8b67
+                bdbed41738ab9c69373dfede96b626abbdda20
+            67/
+                078ff6564914b2c0fe9f0ca6835190d3a86cb5
+                ecf65197829295f00fd74ae371f6abfaa48dca
+            68/
+                08f5ec511cf6ab57ba3c550dfe787170882c76
+                1043ab942f03473064e2ceb86905bf98e41f5b
+                58ad4e514abcf26d8d591cf4da8bbec511777e
+            69/
+                09192418d8ced70e4172eaeda9f8ca546d8c6a
+            6a/
+                4352649e381ed3f2a2162dc899ea009360d880
+            6b/
+                c4122c5ae1ccfe082c84d56b139a4c49129c89
             6c/
                 3f4fc09e8350ed9a39e763443841a964f5fa78
+            6d/
+                f24f26e72bef53ce5531a754a547e2324efdc5
+            70/
+                37eb390f6343c170800291e0595254f886629d
+                6e0ad9a37594f2f62a41d344bf544b969b685b
+            72/
+                8da6ec3950efdfa4a1289c9bc69ccfde06e0df
+            73/
+                6b75368fa15e84cff0b153488791ca1c484af5
+                f8e5bd82be64c74caae2055e1f1bbd933e62a3
+            74/
+                5c1225b54023363e454a1cb3846adf25d6c65a
+                d1a531c3836c623aa7e11e4b99979ed4156611
+            76/
+                734834bb87276d58228a24243552d787610ff9
+                cac6f1e1b7250ade90d4f57b536f98e36eaf66
+                dd7c08e6da3f2c4235c7e5a46681ad0c6e5090
+            77/
+                93daa10e6355b016c810ff59d7c441dfbc38d7
             78/
                 baf987ac6acab929503f7bbac942c860052a00
+            7b/
+                d7c13581f89b9666be2ee3e2c087eaa7ac8920
+                d9f2ecd4d40b128cda93176d4b8a55ba0d9948
             7d/
+                246f3e6fe8679df14660ae4c67c5217aae6651
                 a928a02dce80eecb5e7daf412b0cc48a8ce1a1
             7e/
+                6ebe31dce5096fcf3eaa52cef9a117dea3f685
                 ae6768c219f483edc3ac7882b703a8650186b0
+            7f/
+                a7fa9f1c4fdcd6f230e29c2deae171b4570dd5
             80/
                 a400fbe7b514c3ffee9b64ef9be91d9ab7f24a
+            82/
+                4bf89b20ddd0bf8fea418569a3c634d3e43df8
             83/
                 4520236a81f57b837640ab8d5ffca79324b856
+            84/
+                2b24c8b905eb1141253e1af2d5ae6155113ded
+            85/
+                603a26a81eb8b196d0f0a44cb0bcc17141e7ea
+                c5a8ba6ce4412c3c071416d0aac4654b1a5eab
+            86/
+                1b9775c5419626cc58ddf8d771dc48d5c4fb61
+            88/
+                0a58c104f10daa3e68c5b9d865b5bb8094d2c2
+            89/
+                26ba12004541c35d6bf7192a82da565098e2ad
+                420054175ddda468ae7221c8a9482816c5bd21
+            8a/
+                c216776bef002f4067b36528b91e4c34283179
+            8b/
+                8d704a60ee4e8e24ab3a8d875a398c282cd855
+                c5f4a97290e7514c383daa65292d57c1f0847d
+            8d/
+                4f62018ce996266cb972fae2cae68628cc929c
+            8e/
+                a816c230cdb816ee22baa6fadfcf29eecc7d39
             8f/
+                4f0d7083f523e48f90893694f05404d959fc52
                 b268a3373c4a1742f18863186374763f7881db
+                e7a94819119402dd98717edda2c80d0cd6b5ba
+            91/
+                1370292279e452f79bb9a5ccabf97f71dfe033
+                220911ac2c5a12e6b85d6d52a3fe6abfb047b7
+            92/
+                c94b9203e269a889cdae2b9057e542fecb91ea
+                cffe0226123a199884ab67ba9e4fd64018b210
             93/
                 f4d205e3b55b63933b5fc5f27ae210e264ba01
+            94/
+                850b22c9be16d9f4d95c0d8011a5a9718705c8
+            95/
+                7ae596b4f068a77b9b034c26162e3fcb1f4cc5
             96/
+                0d1d0676b8335327600a9a209f04d1ac5786ed
                 dfca83c1864cbf9c71942725242083ea6f94ce
+            97/
+                30b7b4251717d1088de92ee9899aa3ea8c20a1
+            9a/
+                77d70b9709591db2154dc1d8807525badd2caf
+                85a5239e6e41f17bd3ac8dd8d0789c7482dacb
             9e/
+                7cb148bb806e128d9000e438f6773318a8ffbd
+                dc2b70215658a2587927484e2b9f26209973ad
+                e3338ee6c665fbd95a8c71c51b9e3f25d03aa6
                 e3a5d309629d24b18ae50410a822189055714a
+            a1/
+                09b00774bf3231526f62ed460b38acc75310f0
+            a2/
+                8284d502a9f182a21d03ccc91b6c23eeadeaa3
             a3/
+                9195ec2d1b7aa3b0e22d1cca50b679175b1bd7
                 fd8bc2582b58ddf0701408194f562ceb83110f
+            a4/
+                25cd533f6f8915276bab9cd932e3960e171b5d
             a5/
                 9007f0c94fafa5e7eb97d25c5ac2822a16877f
+            a7/
+                d18f953a0172525b22ace263383eaef819632a
             a8/
                 65c8eb0f4d7b2cb074dd54cd8fc3db4dd0b35c
             a9/
+                2a46033fc05199b62267064308f61ff4b13c0d
                 ce563f4ccc5f6093d16ed0aaeac2939efbab01
+            aa/
+                5165733b9cb2a479a739b4e7539f8b2d869a2a
+            ab/
+                76ca9a491e49938b7d3f9450b6885c9e71ae31
+                b5c3dd7b57ec615c8e28e28c3f8bad70cb128e
+                f6c4dba3a8dc334ddea46df7ed554d5840e6e2
+            ac/
+                5c1af797eeece48d672a048cd0273d63a49b1f
+                6f72574b93ee2523c3bc7ea7c0d12a851773ba
             ad/
                 369db443019c88be102ba88d158970c4ccdc25
+                729b191660d6b7418636da93eb6f88fd147ad4
+            af/
+                c7a84122e50c0447adebc2b90f14a670ecf482
+            b1/
+                825c678c08abf89ffb40367df6bd1a526f4a56
+            b2/
+                6e6f8b6752d64c52b662bd4ea74a335702ef40
+            b4/
+                4af757985962faf3148aa890aa94029dd47dbf
+                521c1e4616a895932f43817b732337df684eb4
             b7/
                 f85a59e3bb764ba461ca00de2204704d56cfc8
             b9/
                 525d11848aeb3ea88f9562c7cbbcf05be2d591
+                a050815c032f127834ab0564e084dbf20757a6
             ba/
                 aa474e39571a6addf6ed1093feaadea763fdaa
+                c42949ea4a3f03f56cf159411da5ea6199360d
+            bc/
+                87e44da149bb669d629f612a7da3e726210901
+            bf/
+                2689c195e7c9bdd04563bb2aecce74cec6ab3e
+                4e4af5e54d86c5707e6e39796c1557d7cae80c
+                95e2b031c07ece59542c9f7f664be9d9b10c95
+                bc27fe8df99ddba01067704d8096d6f577bd18
+            c0/
+                0a587af8a1073c19de3c1a4d6f7b8bd6fde74a
+                38e016d176e0408d4d506ec3de5a5b17fe24b7
+                5edce6b35f09af323120010e127f3fe6afce98
+                d530ea1ac8d4001a32c4cd838047798eb2842c
+            c1/
+                6558ad8b558d64473a53a990fc4e1fd205ca8e
+                845298fc2bbda433a1f7ef38c9eb24cbcdc89d
+                cb12a00a8bebbd9c57c2c8ecfe656d5f596037
+                d9508ab4ffcc75b755a921d5af20c2406e7025
+            c3/
+                34cd7ad4d3a122efa14efd4fdbb68ec4d65345
+            c4/
+                3c22d2acc6931113e3dafa7582277027de2091
             c7/
                 871a0d3377f90339effa100ac16b3e6ec24581
+                879161cef8dbd2bfc8de144e79beb143e59687
+            ca/
+                3a24e57c6cf6a8ab1b75f96f670f092b262a01
             cc/
                 0a780f0e8a40083320e85ae758dbe26d34a470
+                2b2d3bbdca73a5c22563d85a37a750873ffb49
+                338f8494631d242ab5d1fb993a686481ad5532
+                bd792e3c0dad9619247b5ef43b7644a6477d29
+            cd/
+                dff22f968c005fe681723134ec65cf966e4612
+            ce/
+                b2ba435b440799849a15865e243a13ef421314
+            cf/
+                54f23417ed3932afc6e02de192bab4606737a0
+                b0f7c2d5f002f44990720cbe81d25c5c10e11f
+            d0/
+                19ccd389b2578aa7a21999a13896e6f8459c0e
+                b561958fe6c8e9432d539c12001818eef7dc14
+            d1/
+                e8c0ce8e42ee9fe468b428bab6ab3ed81bd741
+            d4/
+                454c4cbca671bf3842091c163769f84b3e5de6
+            d7/
+                30df8754463b9849ee0a5a22adaa6b5412af81
+            d8/
+                a00bb67b0f433066cfba8c047a9c6ad4f0ed0d
+                a39eda66a828962b05acb8fa251b3bd3e59c1c
+            d9/
+                11ccffa529e49e4024d023f874e7a66dfd471c
+                611a7d197d3fbfe0e3a2cc95a757015afaea86
+                bce9c8ed6f00d005677497c3e124c9dfbbdb19
             da/
                 727097c4c594a1ed28d8aac9801448b796fa62
+            db/
+                a57b0546963d1258df292df2805ea0265d01a5
+                a8a45e947dcf5669ab6dfe04842432f5266ab7
             dd/
+                74185b5a0a46b69ba2035d7dfbfb4dca749571
+                83e7943552dc4e46fb470b1cb332fe03500e04
                 c9be8ce1e9c22b9f973ad8c94e204927c40ed2
+            df/
+                c38f9390fdfc48b551d0a698b650859f4ced91
+            e0/
+                0e70ac41ec9365536f50917c67a1179780afc7
+                6a8373213507aa86feb2ddf01798a45666d593
+            e1/
+                18511bac94a549671cb7cc43e3477b3b76311a
+            e3/
+                214e4877bb944f289e6e0cac3b45ee3094609c
+                5b8952df5cf08f941a51eb28154eb5406c84fc
+                b8ceaa72745c85c7042d98efaff4c5d937b5f4
+            e4/
+                9d19b42a92cf50138844fa0d8a20b536cbb70f
+            e7/
+                0f4a70d17df150f2e56dcb5776c919ddcfacca
+            e8/
+                21bab280f0e8f18796fede147db7c181b0cb5b
+                a93a39012eeebe5804afe5b898fb6cd3136a8d
+            e9/
+                00351b591ad5a3a404d835fc1cc31ad7cc3dae
+            ee/
+                5c43a4b9e6eb339fdb526b7e5c6efcb64fa505
+                b29609b6eff6d948263f92e961ec6820cd2de3
+                b9022c7d0a6059192b969d8330cc3057bf3897
+                f6b035e63e5eba25c9b91cd9e8941c6132d955
+            ef/
+                3a55e0c61f41d2368f96f0f60065295c409dd0
+            f1/
+                45501e4aae9f923140dab464ad5b98eb2bd2e1
+            f2/
+                08cf2ba45feb38d7dbeeaae92f330e771b93ec
+                23516f57df762a1685185e4c6ee6fde00b8ec0
+            f3/
+                04950c1130af4bac67ea2d5e21e217217e9861
+                d19c8538467248cba2aba5f09efb6c75a78775
             f4/
+                093c44461f8a2bc74511c78ac06ef03f79e245
                 093f62fbe715b8b1e12b414c2b02d035c86d43
+                fda5d8d59a05e00bf5337e0b650c2069b27a5f
             f5/
                 773da3aa4ee40e55d5ab0e9922a56af05b7dd1
+            f6/
+                516e9eb034cb26e323a5498758b07f5e127e3f
+                9f0eebb217cc6384b53f3d50ba760398717cb9
+            f7/
+                8c3a30955e02b31f67abc1f94193e92f11fc44
+            f8/
+                b5632fc4640047577a46ad406592090bcd0d55
+                c4025e77242461253f42dba18722f7e8e690a4
+            f9/
+                745660434c5ef9e628ab840bc74feb740d6a14
+            fa/
+                815c6782d7ad613051b6a311128d063caaef5b
+                bd65e7bde924693af5340547e7f9f39c6edefb
+                e57542e13becffd24ffb632450b14002402455
+            fb/
+                71a0cf8fb0727afa24b65831da0acdc8ea9945
+            fd/
+                b35ab283cc7291507f9b318d7a3cc817f0db55
+                d6fea800b70f62b726b2eb340cf95c2828776b
+            ff/
+                abd58df5fa43aca90c07585afbe4e6824115e0
+                fad40542f633a9ca6239fdb1e28b609f20005b
             info/
             pack/
         refs/
@@ -876,10 +3130,298 @@ elif __name__ == "__main__" and IS_TRAINING:
                 master
             remotes/
                 origin/
+                    HEAD
                     master
             tags/
+                1.0.0
                 v1.0.1
+                v2.0.0
+                v2.0.1
+                v3.0.0
+                v3.0.2
+                v3.0.3
+    datasets/
+        final_dataset/
+            cnn_3s_dataset/
+                npy_inspection_report.txt
+                test/
+                    kaggle_metadata.csv
+                    metadata.csv
+                train/
+                    kaggle_metadata.csv
+                    metadata.csv
+                val/
+                    kaggle_metadata.csv
+                    metadata.csv
+            vit_3s_dataset/
+                npy_inspection_report.txt
+                test/
+                    kaggle_metadata.csv
+                    metadata.csv
+                train/
+                    kaggle_metadata.csv
+                    metadata.csv
+                val/
+                    kaggle_metadata.csv
+                    metadata.csv
+    demo_workflow/
+        data_preprocessing.py
+        main_workflow.py
+        pipeline.txt
+        sample.ipynb
+        models/
+            basic_cnn.py
+            basic_vit.py
+            __pycache__/
+                basic_cnn.cpython-312.pyc
+                basic_vit.cpython-312.pyc
+    manual_dataset/
+        fake/
+            LJ001-0116.wav
+            LJ002-0187_gen.wav
+            LJ002-0326_gen.wav
+            LJ003-0063_gen.wav
+            LJ003-0227.wav
+            LJ003-0281.wav
+            LJ003-0286_gen.wav
+            LJ003-0301_generated.wav
+            LJ003-0327_generated.wav
+            LJ004-0166_gen.wav
+            LJ004-0209_generated.wav
+            LJ004-0225_gen.wav
+            LJ005-0231_gen.wav
+            LJ005-0288_gen.wav
+            LJ006-0101_gen.wav
+            LJ007-0056_gen.wav
+            LJ008-0047_gen.wav
+            LJ008-0056_gen.wav
+            LJ008-0273_gen.wav
+            LJ008-0274_generated.wav
+            LJ010-0234_gen.wav
+            LJ011-0037.wav
+            LJ011-0109_gen.wav
+            LJ011-0142.wav
+            LJ011-0191.wav
+            LJ012-0045_gen.wav
+            LJ012-0205_gen.wav
+            LJ012-0285_gen.wav
+            LJ013-0263_gen.wav
+            LJ014-0063.wav
+            LJ014-0174_gen.wav
+            LJ014-0181_gen.wav
+            LJ014-0212.wav
+            LJ015-0025_gen.wav
+            LJ015-0100_gen.wav
+            LJ015-0113_generated.wav
+            LJ015-0202_gen.wav
+            LJ015-0291_gen.wav
+            LJ016-0053.wav
+            LJ016-0124_gen.wav
+            LJ016-0147_gen.wav
+            LJ016-0202_gen.wav
+            LJ016-0264_gen.wav
+            LJ016-0302_gen.wav
+            LJ017-0073_gen.wav
+            LJ017-0177_gen.wav
+            LJ017-0244_gen.wav
+            LJ018-0248_gen.wav
+            LJ018-0336_generated.wav
+            LJ019-0303_generated.wav
+            LJ019-0380_generated.wav
+            LJ021-0120_gen.wav
+            LJ022-0025_gen.wav
+            LJ025-0128_gen.wav
+            LJ025-0131_gen.wav
+            LJ025-0143_gen.wav
+            LJ026-0021_generated.wav
+            LJ028-0096_gen.wav
+            LJ028-0331_gen.wav
+            LJ029-0009_gen.wav
+            LJ030-0155_gen.wav
+            LJ031-0008.wav
+            LJ032-0193_gen.wav
+            LJ032-0206.wav
+            LJ033-0070_gen.wav
+            LJ033-0134_gen.wav
+            LJ034-0121_gen.wav
+            LJ035-0164_gen.wav
+            LJ035-0179_generated.wav
+            LJ036-0041_gen.wav
+            LJ036-0113_gen.wav
+            LJ037-0043_gen.wav
+            LJ037-0125_gen.wav
+            LJ037-0198_gen.wav
+            LJ037-0224_generated.wav
+            LJ038-0012_gen.wav
+            LJ038-0113_gen.wav
+            LJ038-0124_gen.wav
+            LJ039-0107.wav
+            LJ039-0218_gen.wav
+            LJ039-0246.wav
+            LJ040-0153_gen.wav
+            LJ042-0048.wav
+            LJ042-0053_gen.wav
+            LJ042-0150_gen.wav
+            LJ042-0193_gen.wav
+            LJ042-0234_gen.wav
+            LJ042-0237_generated.wav
+            LJ044-0115_generated.wav
+            LJ045-0150_gen.wav
+            LJ046-0133.wav
+            LJ046-0230_gen.wav
+            LJ047-0008_generated.wav
+            LJ047-0081_gen.wav
+            LJ047-0082_gen.wav
+            LJ047-0241_gen.wav
+            LJ048-0152_gen.wav
+            LJ048-0230_gen.wav
+            LJ050-0046_gen.wav
+            LJ050-0097_gen.wav
+        real/
+            LJ001-0023.wav
+            LJ001-0128.wav
+            LJ002-0057.wav
+            LJ003-0044.wav
+            LJ003-0257.wav
+            LJ003-0269.wav
+            LJ003-0326.wav
+            LJ004-0116.wav
+            LJ004-0179.wav
+            LJ004-0188.wav
+            LJ005-0039.wav
+            LJ005-0132.wav
+            LJ006-0233.wav
+            LJ006-0304.wav
+            LJ007-0039.wav
+            LJ007-0243.wav
+            LJ008-0265.wav
+            LJ008-0284.wav
+            LJ009-0029.wav
+            LJ009-0164.wav
+            LJ010-0045.wav
+            LJ010-0109.wav
+            LJ010-0283.wav
+            LJ012-0223.wav
+            LJ013-0043.wav
+            LJ013-0155.wav
+            LJ014-0274.wav
+            LJ014-0309.wav
+            LJ015-0221.wav
+            LJ016-0272.wav
+            LJ017-0025.wav
+            LJ017-0235.wav
+            LJ018-0065.wav
+            LJ018-0078.wav
+            LJ018-0106.wav
+            LJ018-0169.wav
+            LJ018-0351.wav
+            LJ019-0319.wav
+            LJ020-0070.wav
+            LJ021-0028.wav
+            LJ021-0079.wav
+            LJ021-0146.wav
+            LJ022-0011.wav
+            LJ022-0048.wav
+            LJ022-0190.wav
+            LJ023-0005.wav
+            LJ023-0111.wav
+            LJ024-0036.wav
+            LJ024-0080.wav
+            LJ026-0043.wav
+            LJ026-0129.wav
+            LJ026-0134.wav
+            LJ026-0164.wav
+            LJ027-0095.wav
+            LJ028-0465.wav
+            LJ029-0005.wav
+            LJ029-0077.wav
+            LJ029-0080.wav
+            LJ029-0150.wav
+            LJ030-0150.wav
+            LJ030-0233.wav
+            LJ031-0221.wav
+            LJ032-0076.wav
+            LJ032-0097.wav
+            LJ032-0103.wav
+            LJ032-0161.wav
+            LJ033-0150.wav
+            LJ034-0063.wav
+            LJ035-0135.wav
+            LJ035-0137.wav
+            LJ036-0121.wav
+            LJ036-0190.wav
+            LJ036-0206.wav
+            LJ037-0268.wav
+            LJ038-0290.wav
+            LJ039-0186.wav
+            LJ040-0092.wav
+            LJ040-0138.wav
+            LJ041-0107.wav
+            LJ042-0077.wav
+            LJ042-0115.wav
+            LJ042-0125.wav
+            LJ042-0169.wav
+            LJ042-0217.wav
+            LJ044-0023.wav
+            LJ044-0077.wav
+            LJ044-0182.wav
+            LJ044-0201.wav
+            LJ044-0236.wav
+            LJ045-0084.wav
+            LJ045-0244.wav
+            LJ046-0148.wav
+            LJ046-0251.wav
+            LJ047-0076.wav
+            LJ047-0124.wav
+            LJ048-0037.wav
+            LJ048-0062.wav
+            LJ048-0276.wav
+            LJ050-0116.wav
+            LJ050-0199.wav
+    notebooks/
+        cnn-trainer.ipynb
+        cnn_trainer.py
+        vit-trainer.ipynb
+        vit_trainer.py
+        __pycache__/
+            cnn_trainer.cpython-312.pyc
+    results/
+        CNN/
+            best_model_CNN_Large_cnn_3s_dataset_114040.pth
+            best_model_CNN_Small_cnn_3s_dataset_102208.pth
+            results/
+                cm_CNN_Large_cnn_3s_dataset_114040.png
+                cm_CNN_Small_cnn_3s_dataset_102208.png
+        ViT/
+            best_model_ViT_Large_vit_3s_dataset_044740.pth
+            best_model_ViT_Small_vit_3s_dataset_040441.pth
+            results/
+                cm_ViT_Large_vit_3s_dataset_044740.png
+                cm_ViT_Small_vit_3s_dataset_040441.png
+    scripts/
+        1_data_preprocessing.ipynb
+        2_modify_for_dataset.ipynb
+        3_EDA_datasets.ipynb
+        3_short_audio_files_report.csv
+        4_normalize_for_dataset.ipynb
+        5_resize_length_for_dataset.ipynb
+        5_silent_files_log.txt
+        6_balance_dataset.ipynb
+        7_convert_mel-spectrograms.ipynb
+        8_regenerate_dataset.ipynb
+        4_normalize_for_dataset_graphs/
+            test_fake_duration_distribution.png
+            test_real_duration_distribution.png
+            train_fake_duration_distribution.png
+            train_real_duration_distribution.png
+            val_fake_duration_distribution.png
+            val_real_duration_distribution.png
     static/
         styles.css
     templates/
         index.html
+    utils/
+        modify_metadata_for_kaggle.py
+        view_spectrogram.py
+    __pycache__/
+        main_deploy.cpython-312.pyc
