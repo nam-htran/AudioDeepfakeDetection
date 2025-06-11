@@ -1,131 +1,173 @@
-/* static/styles.css */
+/* static/css/style.css */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+:root {
+    --primary-color: #0d6efd;
+    --secondary-color: #6c757d;
+    --success-color: #198754;
+    --danger-color: #dc3545;
+    --warning-color: #ffc107;
+    --light-color: #f8f9fa;
+    --dark-color: #212529;
+    --font-family: 'Inter', sans-serif;
+    --border-radius: 0.5rem;
+    --box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
 
 body {
-    font-family: Arial, sans-serif;
-    margin: 20px;
-    background-color: #f4f4f9;
-    color: #333;
+    font-family: var(--font-family);
+    background-color: #f0f2f5;
+    color: var(--dark-color);
     line-height: 1.6;
 }
 
-h1 {
-    color: #333;
+.container {
+    max-width: 900px;
+}
+
+.main-header {
     text-align: center;
-    margin-bottom: 30px;
+    padding: 2.5rem 0;
+    margin-bottom: 2rem;
+    border-bottom: 1px solid #dee2e6;
 }
 
-h3 {
-    color: #555;
-    margin-top: 30px;
-    border-bottom: 1px solid #ddd;
-    padding-bottom: 5px;
+.main-header h1 {
+    font-weight: 700;
+    color: var(--dark-color);
+    letter-spacing: -1px;
 }
 
-form {
-    background-color: #fff;
-    padding: 25px;
-    border-radius: 8px;
-    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+.main-header .lead {
+    color: var(--secondary-color);
     max-width: 600px;
-    margin: 0 auto;
+    margin: 0.5rem auto 0;
 }
 
-label {
-    display: block;
-    margin-bottom: 8px;
-    font-weight: bold;
-    color: #555;
+.upload-section, .results-section {
+    background-color: #ffffff;
+    padding: 2.5rem;
+    border-radius: var(--border-radius);
+    box-shadow: var(--box-shadow);
+    margin-bottom: 2rem;
 }
 
-input[type="file"] {
-    margin-bottom: 20px;
-    padding: 10px;
-    border: 1px solid #ddd;
-    border-radius: 4px;
-    width: calc(100% - 22px); /* Adjust for padding and border */
+.form-label {
+    font-weight: 600;
+    margin-bottom: 0.75rem;
 }
 
-input[type="checkbox"] {
-    margin-right: 8px;
-    vertical-align: middle;
-}
-
-/* Style for checkbox labels to align better */
-input[type="checkbox"] + label {
-    display: inline-block; /* Allows vertical alignment and prevents block behavior */
-    margin-bottom: 10px;   /* Spacing between checkbox options */
-    font-weight: normal;   /* Regular font weight for options */
-    color: #333;
-}
-
-
-button[type="submit"] {
-    background-color: #007bff;
-    color: white;
-    padding: 12px 20px;
-    border: none;
-    border-radius: 4px;
+.form-control-file {
+    padding: 1rem;
+    border: 2px dashed #ced4da;
+    border-radius: var(--border-radius);
+    text-align: center;
     cursor: pointer;
-    font-size: 16px;
-    transition: background-color 0.3s ease;
-    display: block; /* Make button take full width of its container if needed */
-    width: 100%;    /* Make button take full width */
-    margin-top: 10px; /* Add some space above the button */
+    transition: background-color 0.2s ease, border-color 0.2s ease;
 }
 
-button[type="submit"]:hover {
-    background-color: #0056b3;
+.form-control-file:hover {
+    background-color: var(--light-color);
+    border-color: var(--primary-color);
 }
 
-p.error-message { /* Class for error messages from server-side validation */
-    color: #D8000C; /* Dark red */
-    background-color: #FFD2D2; /* Light red */
-    border: 1px solid #D8000C;
-    padding: 10px;
-    border-radius: 4px;
-    margin-bottom: 20px;
-    text-align: center;
-}
-
-ul {
-    list-style-type: none;
-    padding: 0;
-    max-width: 600px;
-    margin: 20px auto; /* Center the results list */
-}
-
-li {
-    background-color: #fff;
-    margin-bottom: 15px;
-    padding: 15px;
-    border-radius: 8px;
-    box-shadow: 0 1px 5px rgba(0, 0, 0, 0.05);
-    border-left: 5px solid #007bff; /* Accent border */
-}
-
-li strong {
-    color: #0056b3;
+.form-control-file::before {
+    content: 'Kéo & thả file vào đây hoặc nhấn để chọn';
     display: block;
-    margin-bottom: 5px;
+    color: var(--secondary-color);
 }
 
-span.error-prediction { /* Class for prediction-specific errors */
-    color: #e67e22; /* Orange for warnings/non-critical errors */
-    font-style: italic;
-    font-size: 0.9em;
+.form-control-file:focus {
+    box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25);
 }
 
-/* Container for model selection to group them visually */
-.model-selection-container {
-    margin-bottom: 20px;
-    padding: 15px;
-    border: 1px solid #eee;
-    border-radius: 4px;
-    background-color: #f9f9f9;
+.model-selection .form-check {
+    background-color: var(--light-color);
+    padding: 0.75rem 1.25rem;
+    border-radius: var(--border-radius);
+    margin-right: 0.5rem;
+    margin-bottom: 0.5rem;
+    transition: background-color 0.2s ease, box-shadow 0.2s ease;
 }
 
-.model-selection-container label { /* Main label for the group */
-    font-weight: bold;
-    color: #555;
-    margin-bottom: 10px; /* Space after "Chọn Model để dự đoán:" */
+.model-selection .form-check-input:checked + .form-check-label {
+    font-weight: 600;
+    color: var(--primary-color);
+}
+
+.btn-primary {
+    font-weight: 600;
+    padding: 0.8rem 1.5rem;
+    border-radius: var(--border-radius);
+    transition: background-color 0.2s ease, transform 0.1s ease;
+}
+
+.btn-primary:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+}
+
+.results-section h2 {
+    font-weight: 600;
+    border-bottom: 1px solid #e9ecef;
+    padding-bottom: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+.result-card {
+    border: none;
+    border-radius: var(--border-radius);
+    box-shadow: var(--box-shadow);
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.result-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 8px 20px rgba(0,0,0,0.1);
+}
+
+.result-card.real {
+    border-left: 5px solid var(--success-color);
+}
+.result-card.fake {
+    border-left: 5px solid var(--danger-color);
+}
+.result-card.error {
+    border-left: 5px solid var(--warning-color);
+}
+
+.result-card .card-header {
+    background-color: transparent;
+    border-bottom: 1px solid #e9ecef;
+    font-weight: 600;
+}
+
+.result-card .card-title {
+    font-size: 1.5rem;
+    font-weight: 700;
+}
+
+.result-card .real-text { color: var(--success-color); }
+.result-card .fake-text { color: var(--danger-color); }
+
+.result-card .confidence-label {
+    font-size: 0.9rem;
+    color: var(--secondary-color);
+    margin-bottom: 0.25rem;
+}
+
+.progress {
+    height: 1.5rem;
+    border-radius: var(--border-radius);
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+
+.footer {
+    text-align: center;
+    padding: 2rem 0;
+    margin-top: 2rem;
+    color: var(--secondary-color);
+    font-size: 0.9rem;
 }
