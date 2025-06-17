@@ -1,0 +1,173 @@
+/* static/css/style.css */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+:root {
+    --primary-color: #0d6efd;
+    --secondary-color: #6c757d;
+    --success-color: #198754;
+    --danger-color: #dc3545;
+    --warning-color: #ffc107;
+    --light-color: #f8f9fa;
+    --dark-color: #212529;
+    --font-family: 'Inter', sans-serif;
+    --border-radius: 0.5rem;
+    --box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+body {
+    font-family: var(--font-family);
+    background-color: #f0f2f5;
+    color: var(--dark-color);
+    line-height: 1.6;
+}
+
+.container {
+    max-width: 900px;
+}
+
+.main-header {
+    text-align: center;
+    padding: 2.5rem 0;
+    margin-bottom: 2rem;
+    border-bottom: 1px solid #dee2e6;
+}
+
+.main-header h1 {
+    font-weight: 700;
+    color: var(--dark-color);
+    letter-spacing: -1px;
+}
+
+.main-header .lead {
+    color: var(--secondary-color);
+    max-width: 600px;
+    margin: 0.5rem auto 0;
+}
+
+.upload-section, .results-section {
+    background-color: #ffffff;
+    padding: 2.5rem;
+    border-radius: var(--border-radius);
+    box-shadow: var(--box-shadow);
+    margin-bottom: 2rem;
+}
+
+.form-label {
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+}
+
+.form-control-file {
+    padding: 1rem;
+    border: 2px dashed #ced4da;
+    border-radius: var(--border-radius);
+    text-align: center;
+    cursor: pointer;
+    transition: background-color 0.2s ease, border-color 0.2s ease;
+}
+
+.form-control-file:hover {
+    background-color: var(--light-color);
+    border-color: var(--primary-color);
+}
+
+.form-control-file::before {
+    content: 'Kéo & thả file vào đây hoặc nhấn để chọn';
+    display: block;
+    color: var(--secondary-color);
+}
+
+.form-control-file:focus {
+    box-shadow: 0 0 0 0.25rem rgba(13, 110, 253, 0.25);
+}
+
+.model-selection .form-check {
+    background-color: var(--light-color);
+    padding: 0.75rem 1.25rem;
+    border-radius: var(--border-radius);
+    margin-right: 0.5rem;
+    margin-bottom: 0.5rem;
+    transition: background-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.model-selection .form-check-input:checked + .form-check-label {
+    font-weight: 600;
+    color: var(--primary-color);
+}
+
+.btn-primary {
+    font-weight: 600;
+    padding: 0.8rem 1.5rem;
+    border-radius: var(--border-radius);
+    transition: background-color 0.2s ease, transform 0.1s ease;
+}
+
+.btn-primary:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+}
+
+.results-section h2 {
+    font-weight: 600;
+    border-bottom: 1px solid #e9ecef;
+    padding-bottom: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+.result-card {
+    border: none;
+    border-radius: var(--border-radius);
+    box-shadow: var(--box-shadow);
+    transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.result-card:hover {
+    transform: translateY(-5px);
+    box-shadow: 0 8px 20px rgba(0,0,0,0.1);
+}
+
+.result-card.real {
+    border-left: 5px solid var(--success-color);
+}
+.result-card.fake {
+    border-left: 5px solid var(--danger-color);
+}
+.result-card.error {
+    border-left: 5px solid var(--warning-color);
+}
+
+.result-card .card-header {
+    background-color: transparent;
+    border-bottom: 1px solid #e9ecef;
+    font-weight: 600;
+}
+
+.result-card .card-title {
+    font-size: 1.5rem;
+    font-weight: 700;
+}
+
+.result-card .real-text { color: var(--success-color); }
+.result-card .fake-text { color: var(--danger-color); }
+
+.result-card .confidence-label {
+    font-size: 0.9rem;
+    color: var(--secondary-color);
+    margin-bottom: 0.25rem;
+}
+
+.progress {
+    height: 1.5rem;
+    border-radius: var(--border-radius);
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+
+.footer {
+    text-align: center;
+    padding: 2rem 0;
+    margin-top: 2rem;
+    color: var(--secondary-color);
+    font-size: 0.9rem;
+}
