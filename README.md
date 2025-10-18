@@ -32,6 +32,7 @@ The application follows a straightforward pipeline from audio upload to classifi
 
 
 ## Project Structure
+```
 .
 ├── main_deploy.py # Main FastAPI application script
 ├── models/ # Directory for pre-trained model checkpoints (.pth files)
@@ -46,7 +47,7 @@ The application follows a straightforward pipeline from audio upload to classifi
 │ ├── fake/
 │ └── real/
 └── README.md # This file
-
+```
 ## Setup and Installation
 
 ### Prerequisites
